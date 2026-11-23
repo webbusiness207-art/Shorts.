@@ -155,23 +155,43 @@ def pick_files(folder, exts):
     return [p for p in folder.iterdir() if p.suffix.lower() in exts] if folder.exists() else []
 
 
-def fetch_stock(query, workdir, dur):
-    """Download licensed stock clips from Pexels (free API key), normalise, concat into bg.mp4."""
+def pexels_candidates(query):
     r = requests.get("https://api.pexels.com/videos/search",
                      headers={"Authorization": os.environ["PEXELS_API_KEY"]},
                      params={"query": query, "orientation": "portrait", "per_page": 15}, timeout=30)
     r.raise_for_status()
-    vids = r.json().get("videos", [])
-    random.shuffle(vids)
-    segs, urls, total = [], [], 0.0
-    for v in vids:
+    out = []
+    for v in r.json().get("videos", []):
         files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4"
                  and (f.get("width") or 0) >= 720 and (f.get("height") or 0) > (f.get("width") or 0)]
-        if not files:
-            continue
-        f = min(files, key=lambda f: abs(f["width"] - 1080))
+        if files:
+            f = min(files, key=lambda f: abs(f["width"] - 1080))
+            out.append((f["link"], v.get("url")))
+    return out
+
+
+def pixabay_candidates(query):
+    r = requests.get("https://pixabay.com/api/videos/",
+                     params={"key": os.environ["PIXABAY_API_KEY"], "q": query[:100],
+                             "per_page": 20, "safesearch": "true", "video_type": "film"}, timeout=30)
+    r.raise_for_status()
+    out = []
+    for h in r.json().get("hits", []):
+        vids = h.get("videos", {})
+        pick = next((vids[k] for k in ("medium", "small", "large") if vids.get(k, {}).get("url")), None)
+        if pick:
+            out.append((pick["url"], h.get("pageURL")))
+    return out
+
+
+def fetch_stock(query, workdir, dur):
+    """Download licensed stock clips (Pixabay or Pexels), crop to 9:16, concat into bg.mp4."""
+    cands = pixabay_candidates(query) if os.getenv("PIXABAY_API_KEY") else pexels_candidates(query)
+    random.shuffle(cands)
+    segs, urls, total = [], [], 0.0
+    for link, page in cands:
         raw, seg = workdir / f"raw{len(segs)}.mp4", workdir / f"seg{len(segs)}.mp4"
-        with requests.get(f["link"], stream=True, timeout=90) as resp:
+        with requests.get(link, stream=True, timeout=90) as resp:
             resp.raise_for_status()
             with raw.open("wb") as fh:
                 for chunk in resp.iter_content(1 << 20):
@@ -181,7 +201,7 @@ def fetch_stock(query, workdir, dur):
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(seg)])
         raw.unlink()
         segs.append(seg)
-        urls.append(v.get("url"))
+        urls.append(page)
         total += probe_duration(seg)
         if total >= dur + 2 or len(segs) >= 6:
             break
@@ -195,7 +215,7 @@ def fetch_stock(query, workdir, dur):
 
 
 def get_background(query, workdir, dur):
-    if os.getenv("PEXELS_API_KEY"):
+    if os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY"):
         bg, urls = fetch_stock(query, workdir, dur)
         return bg, 0.0, urls
     clip = random.choice(pick_files(ROOT / "footage", VIDEO_EXT))
@@ -253,8 +273,8 @@ def preflight():
         errs.append(f"Piper not found: {CFG['piper_bin']}")
     if not Path(CFG["piper_model"]).exists():
         errs.append(f"Piper voice model missing: {CFG['piper_model']}")
-    if not os.getenv("PEXELS_API_KEY") and not pick_files(ROOT / "footage", VIDEO_EXT):
-        errs.append("No footage: set PEXELS_API_KEY or add licensed clips to /footage")
+    if not (os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY")) and not pick_files(ROOT / "footage", VIDEO_EXT):
+        errs.append("No footage: set PIXABAY_API_KEY or add licensed clips to /footage")
     if not os.getenv("GEMINI_API_KEY"):
         try:
             requests.get(CFG["ollama_url"].rsplit("/api", 1)[0], timeout=5)
