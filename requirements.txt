@@ -1,2 +1,5 @@
-requests
-faster-whisper
+requests>=2.31.0
+faster-whisper>=1.0.0
+numpy
+soundfile
+
