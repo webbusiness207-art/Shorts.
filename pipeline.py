@@ -18,7 +18,7 @@ import requests
 ROOT = Path(__file__).parent
 SERIES_NAME = os.getenv("SERIES_NAME", "TRENDING STORIES")
 CFG = {
-    "videos_per_run": int(os.getenv("VIDEOS_PER_RUN", "3")),
+    "videos_per_run": int(os.getenv("VIDEOS_PER_RUN") or "3"),
     "voice": os.getenv("VOICE", "am_michael"),
     "speed": float(os.getenv("VOICE_SPEED", "1.12")),
     "engine": "kokoro",
