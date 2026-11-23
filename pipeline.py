@@ -19,7 +19,6 @@ ROOT = Path(__file__).parent
 CFG = {
     "videos_per_run": int(os.getenv("VIDEOS_PER_RUN") or 3),
     "niche": os.getenv("NICHE") or "mind-blowing space and science facts",
-    "gemini_model": os.getenv("GEMINI_MODEL") or "gemini-2.5-flash",  # check Google AI Studio if this errors
     "ollama_url": "http://localhost:11434/api/generate",
     "ollama_model": "llama3.1:8b",
     "piper_bin": os.getenv("PIPER_BIN") or "piper",
@@ -47,21 +46,60 @@ def probe_duration(path):
     return float(r.stdout.strip())
 
 
+_GEMINI_OK = None
+
+
+def gemini_models(key):
+    """Ask Google which Flash models this key can use, newest non-lite first."""
+    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                     headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
+    r.raise_for_status()
+    names = []
+    for m in r.json().get("models", []):
+        n = m["name"].split("/")[-1]
+        if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n
+                and not re.search(r"image|tts|live|audio|embed|robotics", n)):
+            names.append(n)
+
+    def rank(n):
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("lite" in n, "preview" in n or "exp" in n, -(float(v.group(1)) if v else 0))
+    return sorted(names, key=rank)
+
+
 def llm_json(prompt):
+    global _GEMINI_OK
     key = os.getenv("GEMINI_API_KEY")
     if key:
-        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{CFG['gemini_model']}:generateContent")
+        if _GEMINI_OK:
+            cands = [_GEMINI_OK]
+        else:
+            cands = [os.getenv("GEMINI_MODEL")] if os.getenv("GEMINI_MODEL") else []
+            try:
+                cands += gemini_models(key)
+            except Exception:
+                pass
+            cands += ["gemini-flash-latest", "gemini-2.5-flash"]
+            cands = list(dict.fromkeys(cands))
         body = {"contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
-        for attempt in range(4):
-            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
-            if r.status_code == 429:  # free-tier rate limit: wait and retry
-                time.sleep(25)
+        last = "no models found"
+        for model in cands:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for _ in range(3):
+                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+                if r.status_code == 429:  # free-tier rate limit: wait and retry
+                    time.sleep(25)
+                    continue
+                break
+            if r.status_code in (400, 403, 404, 429):
+                last = f"{model}: HTTP {r.status_code}"
                 continue
             r.raise_for_status()
+            _GEMINI_OK = model
+            print(f"Using Gemini model: {model}")
             return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-        raise RuntimeError("Gemini rate limit: retries exhausted")
+        raise RuntimeError("No Gemini model worked (" + last + ")")
     r = requests.post(CFG["ollama_url"], json={
         "model": CFG["ollama_model"], "prompt": prompt,
         "stream": False, "format": "json"}, timeout=900)
