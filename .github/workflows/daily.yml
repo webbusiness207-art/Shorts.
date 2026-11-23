@@ -2,8 +2,8 @@ name: Daily Shorts
 
 on:
   schedule:
-    - cron: "0 9 * * *
-  workflow_dispatch:       # lets you tap "Run workflow" from your phone
+    - cron: 0 9 * * *
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -55,4 +55,3 @@ jobs:
           name: shorts-${{ github.run_number }}
           path: output/
           retention-days: 14
-
