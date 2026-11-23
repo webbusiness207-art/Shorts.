@@ -1,8 +1,33 @@
-[
- "Why astronauts' bones physically shrink in space and how Earth's gravity holds us together",
- "The terrifying truth about what happens if you fall into a black hole's event horizon",
- "Why time moves differently at the top of a skyscraper compared to the ground",
- "why a spoonful of a neutron star weighs as much as Mount Everest and what it would do to your hand",
- "the terrifying sound of the sun captured by NASA and why sound cannot travel through the vacuum of space",
- "what happens to the human body if you step outside in space without a spacesuit in the freezing vacuum"
-]
+{
+  "episodes": [
+    {
+      "ep": 1,
+      "topic": "cruise ship",
+      "title": "How Cruise Ships Convert Ocean Water",
+      "summary": "An inside look at the hidden water filtration and waste management systems aboard mega cruise ships."
+    },
+    {
+      "ep": 2,
+      "topic": "grand theft auto",
+      "title": "How a Coding Glitch Created Grand Theft Auto",
+      "summary": "Grand Theft Auto was born when a police AI bug in a failing racing game turned unintentional car chases into peak entertainment."
+    },
+    {
+      "ep": 3,
+      "topic": "vanity fair taylor swift",
+      "title": "How Taylor Swift Hides Easter Eggs on Magazine Covers",
+      "summary": "An exploration of how Taylor Swift utilizes magazine photoshoots to secretly signal future album eras and announcements."
+    }
+  ],
+  "used_topics": [
+    "Why astronauts' bones physically shrink in space and how Earth's gravity holds us together",
+    "The terrifying truth about what happens if you fall into a black hole's event horizon",
+    "Why time moves differently at the top of a skyscraper compared to the ground",
+    "why a spoonful of a neutron star weighs as much as Mount Everest and what it would do to your hand",
+    "the terrifying sound of the sun captured by NASA and why sound cannot travel through the vacuum of space",
+    "what happens to the human body if you step outside in space without a spacesuit in the freezing vacuum",
+    "cruise ship",
+    "grand theft auto",
+    "vanity fair taylor swift"
+  ]
+}
