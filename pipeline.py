@@ -1,8 +1,5 @@
-cd /home/claude/shorts_factory && cat > pipeline.py << 'EOF'
 #!/usr/bin/env python3
-"""Shorts Factory v2: connected "brain-rot" style series.
-episode idea -> beats (voice line + visual + label) -> per-beat voice -> word captions
--> fast-cut stock footage -> 1080x1920 video -> daily report. All free tools."""
+"""Trend-driven Shorts Factory: discovers topics, writes original scripts, renders 3 Shorts."""
 import datetime as dt
 import json
 import os
@@ -19,37 +16,31 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).parent
-SERIES_NAME = os.getenv("SERIES_NAME") or "KEVIN'S WORST IDEAS"
-DEFAULT_PREMISE = (
-    "Kevin is an overconfident, clueless guy who tries one absurd 'what if' experiment per episode "
-    "(example scale: what if he did X at 1000x). Each episode escalates through levels of chaos, "
-    "every beat bigger than the last. His friend Dave warns him and is always ignored. "
-    "Running gag: a pigeon is somehow always watching. Every episode ends on a cliffhanger "
-    "teasing Kevin's next terrible idea.")
+SERIES_NAME = os.getenv("SERIES_NAME", "TRENDING STORIES")
 CFG = {
-    "videos_per_run": int(os.getenv("VIDEOS_PER_RUN") or 3),
-    "premise": os.getenv("NICHE") or DEFAULT_PREMISE,
-    "voice": os.getenv("VOICE") or "am_michael",
-    "speed": float(os.getenv("VOICE_SPEED") or 1.15),
-    "engine": "kokoro",  # falls back to piper automatically
+    "videos_per_run": int(os.getenv("VIDEOS_PER_RUN", "3")),
+    "voice": os.getenv("VOICE", "am_michael"),
+    "speed": float(os.getenv("VOICE_SPEED", "1.12")),
+    "engine": "kokoro",
     "ollama_url": "http://localhost:11434/api/generate",
-    "ollama_model": "llama3.1:8b",
-    "piper_bin": os.getenv("PIPER_BIN") or "piper",
+    "ollama_model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+    "piper_bin": os.getenv("PIPER_BIN", "piper"),
     "piper_model": str(ROOT / "models" / "en_US-lessac-medium.onnx"),
-    "font": os.getenv("CAPTION_FONT") or "DejaVu Sans",
-    "whisper_model": "small",
+    "font": os.getenv("CAPTION_FONT", "DejaVu Sans"),
+    "whisper_model": os.getenv("WHISPER_MODEL", "small"),
     "music_volume": 0.10,
-    "words_min": 80,
-    "words_max": 150,
+    "words_min": 75,
+    "words_max": 135,
 }
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".ogg"}
 TODAY = dt.date.today().isoformat()
 OUT_DAY = ROOT / "output" / TODAY
-STATE_FILE = ROOT / "used_topics.json"  # holds the episode history (kept for workflow compatibility)
+STATE_FILE = ROOT / "used_topics.json"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "ShortsFactory/3.0 (trend research; contact: local-run)"})
 
 
-# ---------- helpers ----------
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
@@ -61,27 +52,94 @@ def probe_duration(path):
 
 
 def pick_files(folder, exts):
-    return [p for p in folder.iterdir() if p.suffix.lower() in exts] if folder.exists() else []
+    return [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts] if folder.exists() else []
 
 
-# ---------- LLM (Gemini free tier, auto-picks a working model) ----------
+# ---------- topic discovery ----------
+def google_trends():
+    """Google's public daily trending-search RSS; availability/coverage can vary."""
+    urls = [
+        "https://trends.google.com/trending/rss?geo=US",
+        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=US",
+    ]
+    for url in urls:
+        try:
+            resp = SESSION.get(url, timeout=20)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            items = []
+            for item in root.iter("item"):
+                title = (item.findtext("title") or "").strip()
+                traffic = (item.findtext("{https://trends.google.com/trending/rss}approx_traffic") or "").strip()
+                if title:
+                    items.append({"topic": title, "source": "Google Trends", "signal": traffic})
+            if items:
+                return items[:20]
+        except Exception as exc:
+            print(f"Google Trends unavailable: {exc}")
+    return []
+
+
+def youtube_trends():
+    """Optional YouTube Data API signal: recent high-view videos for currently popular queries.
+    This is a discovery signal, not an official Shorts trending feed."""
+    key = os.getenv("YOUTUBE_API_KEY")
+    if not key:
+        return []
+    terms = ["trending", "viral", "new technology", "gaming", "science", "internet culture"]
+    found = []
+    published_after = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    for term in terms:
+        try:
+            r = SESSION.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={"part": "snippet", "type": "video", "order": "viewCount",
+                        "publishedAfter": published_after, "maxResults": 5,
+                        "q": term, "key": key},
+                timeout=20,
+            )
+            r.raise_for_status()
+            for item in r.json().get("items", []):
+                title = item.get("snippet", {}).get("title", "").strip()
+                if title:
+                    found.append({"topic": title, "source": "YouTube recent high-view search", "signal": term})
+        except Exception as exc:
+            print(f"YouTube trend lookup failed for {term}: {exc}")
+            break
+    return found[:20]
+
+
+def get_trend_candidates():
+    candidates = google_trends() + youtube_trends()
+    # Deduplicate while preserving source order.
+    seen, clean = set(), []
+    for item in candidates:
+        key = re.sub(r"\W+", " ", item["topic"].lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            clean.append(item)
+    return clean[:30]
+
+
+# ---------- LLM ----------
 _GEMINI_OK = None
 
 
 def gemini_models(key):
-    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                     headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
+    r = SESSION.get("https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
     r.raise_for_status()
     names = []
-    for m in r.json().get("models", []):
-        n = m["name"].split("/")[-1]
-        if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n
-                and not re.search(r"image|tts|live|audio|embed|robotics", n)):
-            names.append(n)
-
-    def rank(n):
-        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-        return ("preview" in n or "exp" in n, "lite" not in n, -(float(v.group(1)) if v else 0))
+    for model in r.json().get("models", []):
+        name = model["name"].split("/")[-1]
+        if ("generateContent" in model.get("supportedGenerationMethods", [])
+                and "flash" in name
+                and not re.search(r"image|tts|live|audio|embed|robotics", name)):
+            names.append(name)
+    def rank(name):
+        version = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        return ("preview" in name or "exp" in name, "lite" not in name,
+                -(float(version.group(1)) if version else 0))
     return sorted(names, key=rank)
 
 
@@ -90,114 +148,143 @@ def llm_json(prompt):
     key = os.getenv("GEMINI_API_KEY")
     if key:
         if _GEMINI_OK:
-            cands = [_GEMINI_OK]
+            candidates = [_GEMINI_OK]
         else:
-            cands = [os.getenv("GEMINI_MODEL")] if os.getenv("GEMINI_MODEL") else []
+            candidates = [os.getenv("GEMINI_MODEL")] if os.getenv("GEMINI_MODEL") else []
             try:
-                cands += gemini_models(key)
-            except Exception:
-                pass
-            cands += ["gemini-flash-latest", "gemini-2.5-flash"]
-            cands = list(dict.fromkeys(cands))
+                candidates += gemini_models(key)
+            except Exception as exc:
+                print(f"Gemini model discovery failed: {exc}")
+            candidates += ["gemini-flash-latest", "gemini-2.5-flash"]
+            candidates = list(dict.fromkeys(x for x in candidates if x))
         body = {"contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-        last = "no models found"
-        for model in cands:
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
+        last_error = "no models found"
+        for model in candidates:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            r = None
-            for _ in range(3):
+            for attempt in range(3):
                 try:
-                    r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=75)
-                except requests.exceptions.RequestException as e:
-                    last = f"{model}: {type(e).__name__}"
-                    print(f"Gemini {last}, trying next model")
-                    r = None
+                    response = SESSION.post(url, headers={"x-goog-api-key": key},
+                                            json=body, timeout=90)
+                    if response.status_code == 429 and attempt < 2:
+                        time.sleep(15 * (attempt + 1))
+                        continue
+                    if response.status_code in (400, 403, 404, 429, 500, 503):
+                        last_error = f"{model}: HTTP {response.status_code}"
+                        break
+                    response.raise_for_status()
+                    text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    _GEMINI_OK = model
+                    print(f"Using Gemini model: {model}")
+                    return json.loads(text)
+                except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as exc:
+                    last_error = f"{model}: {type(exc).__name__}: {exc}"
                     break
-                if r.status_code == 429:
-                    time.sleep(25)
-                    continue
-                break
-            if r is None:
-                continue
-            if r.status_code in (400, 403, 404, 429, 500, 503):
-                last = f"{model}: HTTP {r.status_code}"
-                print(f"Gemini {last}, trying next model")
-                continue
-            r.raise_for_status()
-            _GEMINI_OK = model
-            print(f"Using Gemini model: {model}")
-            return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-        raise RuntimeError("No Gemini model worked (" + last + ")")
-    r = requests.post(CFG["ollama_url"], json={
-        "model": CFG["ollama_model"], "prompt": prompt, "stream": False, "format": "json"}, timeout=900)
-    r.raise_for_status()
-    return json.loads(r.json()["response"])
+        raise RuntimeError("No Gemini model worked (" + last_error + ")")
+    response = SESSION.post(CFG["ollama_url"], json={
+        "model": CFG["ollama_model"], "prompt": prompt, "stream": False, "format": "json"
+    }, timeout=900)
+    response.raise_for_status()
+    return json.loads(response.json()["response"])
 
 
-# ---------- series memory + episode writing ----------
+# ---------- persistent history ----------
 def load_state():
     if STATE_FILE.exists():
         try:
-            d = json.loads(STATE_FILE.read_text())
-            if isinstance(d, dict) and "episodes" in d:
-                return d
-        except Exception:
-            pass
-    return {"episodes": []}
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # Backward compatibility: the old file was sometimes a plain list of topics.
+            if isinstance(data, list):
+                return {"episodes": [], "used_topics": [str(x) for x in data]}
+            if isinstance(data, dict):
+                data.setdefault("episodes", [])
+                data.setdefault("used_topics", [])
+                return data
+        except Exception as exc:
+            print(f"Could not read topic history; starting fresh: {exc}")
+    return {"episodes": [], "used_topics": []}
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=1))
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def trending_hints():
-    try:
-        r = requests.get("https://trends.google.com/trending/rss?geo=US", timeout=20)
-        return [i.findtext("title") for i in ET.fromstring(r.content).iter("item")][:10]
-    except Exception:
-        return []
-
-
-def write_episode(n, state):
-    history = "\n".join(f"EP {e['ep']}: {e['title']} - {e.get('summary', '')}"
-                        for e in state["episodes"][-6:]) or "none yet (this is the first episode)"
+def choose_topic(candidates, state):
+    used = {str(x).strip().lower() for x in state.get("used_topics", [])}
+    recent_titles = {e.get("topic", e.get("title", "")).strip().lower()
+                     for e in state.get("episodes", [])[-30:]}
+    fresh = [x for x in candidates if x["topic"].strip().lower() not in used
+             and x["topic"].strip().lower() not in recent_titles]
+    if not fresh:
+        fresh = candidates
+    if not fresh:
+        # Fallback only if live trend feeds are unavailable.
+        fresh = [
+            {"topic": "Why people are fascinated by strange deep-sea discoveries", "source": "fallback", "signal": ""},
+            {"topic": "The surprising science behind everyday technology", "source": "fallback", "signal": ""},
+            {"topic": "An unexplained historical mystery people are discussing", "source": "fallback", "signal": ""},
+        ]
     prompt = (
-        "You write viral YouTube Shorts scripts in a fast, chaotic, funny 'brain rot' storytelling "
-        "style: every line is a mini-cliffhanger, stakes escalate every beat, Gen-Z voice, zero filler.\n"
-        f"SERIES: {SERIES_NAME}\nPREMISE: {CFG['premise']}\n"
-        f"PREVIOUS EPISODES (stay consistent; call back to one earlier event or the running gag):\n{history}\n"
-        f"Trending today (use ONLY if it fits naturally as a scenario): {trending_hints()}\n\n"
-        f"Write EPISODE {n}: a brand-new scenario, clearly different from every previous episode.\n"
+        "You are a trend editor for an original YouTube Shorts channel. Select ONE topic that has "
+        "the strongest short-form storytelling potential from the candidate list. Prefer timely, "
+        "widely understandable topics with a surprising angle. Avoid tragedy, graphic violence, "
+        "politics, medical misinformation, dangerous challenges, and unverified allegations. "
+        "Do not claim a topic is viral merely because it appears in this list. "
+        "Return JSON only: {\"topic\":\"...\",\"angle\":\"one specific original angle\","
+        "\"reason\":\"brief reason\"}.\nCANDIDATES:\n" +
+        json.dumps(fresh[:25], ensure_ascii=False)
+    )
+    result = llm_json(prompt)
+    topic = str(result.get("topic", "")).strip()
+    if not topic:
+        topic = fresh[0]["topic"]
+    return {"topic": topic, "angle": str(result.get("angle", "")).strip(),
+            "source": next((x["source"] for x in fresh if x["topic"].lower() == topic.lower()), "AI-selected trend")}
+
+
+def write_episode(n, state, trend):
+    history = "\n".join(
+        f"EP {e.get('ep')}: {e.get('topic', e.get('title', ''))} - {e.get('summary', '')}"
+        for e in state["episodes"][-8:]
+    ) or "No previous episodes."
+    prompt = (
+        "Write an original, high-retention YouTube Short script based on the selected topic. "
+        "The style should match strong current short-form storytelling: immediate hook, curiosity, "
+        "clear escalating information, punchy conversational narration, and a satisfying payoff. "
+        "Do not imitate a specific creator. Do not invent current events, quotes, statistics, or facts. "
+        "If a fact cannot be stated confidently, phrase it cautiously or omit it. "
+        "Avoid dangerous real-world instructions, graphic content, medical misinformation, and "
+        "unverified claims about real people.\n"
+        f"CHANNEL: {SERIES_NAME}\nSELECTED TOPIC: {trend['topic']}\n"
+        f"ORIGINAL ANGLE: {trend['angle']}\nTREND SIGNAL SOURCE: {trend['source']}\n"
+        f"RECENT EPISODES (avoid repeating):\n{history}\n"
         "RULES:\n"
-        "- 9 to 13 beats. Each beat is ONE spoken line of 6-16 words.\n"
-        "- Beat 1 is a hook of 10 words or fewer that drops the viewer into the chaos or asks an "
-        "irresistible question.\n"
-        "- Each beat escalates the stakes or adds a twist. Keep it moving; never explain slowly.\n"
-        "- Casual, punchy, funny. PG only: no profanity, no real people, no brands, no dangerous "
-        "real-world instructions. Any real fact or number you state must be true; exaggeration "
-        "must be obviously a joke.\n"
-        "- Last beat: a cliffhanger teasing Kevin's NEXT idea, then asks viewers to comment what "
-        "Kevin should try next.\n"
-        f"- Total spoken words between {CFG['words_min'] + 10} and {CFG['words_max'] - 10}.\n"
-        "- For each beat give \"visual\": 2-3 plain words to search free stock video that fits "
-        "(common, filmable things such as 'city traffic', 'storm clouds', 'shocked man', "
-        "'crowd running', 'rocket launch').\n"
-        "- For each beat give \"label\": a short ALL-CAPS on-screen tag, max 4 words (a level, stat "
-        "or reaction, e.g. 'CHAOS LEVEL 3', '210 DB', 'DAVE IS WORRIED').\n"
-        'Return JSON only: {"title": "under 60 chars, no emoji", "description": "1-2 sentences", '
-        '"tags": ["..."], "summary": "one sentence of what happened", '
-        '"beats": [{"text": "...", "visual": "...", "label": "..."}]}')
+        "- 8 to 12 beats, each one spoken line of 7-16 words.\n"
+        "- First beat is a powerful hook, 10 words maximum.\n"
+        "- Every beat adds a new fact, reveal, escalation, or question.\n"
+        "- Explain enough context that a new viewer understands the story.\n"
+        "- End with a memorable payoff and a natural comment prompt, not fake engagement bait.\n"
+        "- Keep it suitable for a general audience.\n"
+        "- Each beat has visual: 2-4 searchable visual keywords for relevant stock footage.\n"
+        "- Each beat has label: short ALL-CAPS caption tag, maximum 4 words.\n"
+        f"- Total narration: {CFG['words_min']} to {CFG['words_max']} words.\n"
+        'Return JSON only: {"title":"under 60 characters, no emoji",'
+        '"description":"1-2 accurate sentences", "tags":["..."],'
+        '"summary":"one sentence", "beats":[{"text":"...","visual":"...","label":"..."}]}'
+    )
     for _ in range(3):
-        d = llm_json(prompt)
-        beats = d.get("beats") or []
+        data = llm_json(prompt)
+        beats = data.get("beats") or []
         words = sum(len(b.get("text", "").split()) for b in beats)
-        ok = (8 <= len(beats) <= 14 and CFG["words_min"] <= words <= CFG["words_max"] + 20
-              and all(b.get("text") and b.get("visual") for b in beats))
-        if ok:
-            for b in beats:
-                b["label"] = (b.get("label") or "").upper()[:28]
-            return d
-    raise RuntimeError("LLM could not produce a valid episode")
+        valid = (8 <= len(beats) <= 12 and CFG["words_min"] <= words <= CFG["words_max"]
+                 and all(b.get("text") and b.get("visual") for b in beats))
+        if valid:
+            for beat in beats:
+                beat["label"] = (beat.get("label") or "").upper()[:28]
+            data["topic"] = trend["topic"]
+            data["trend_source"] = trend["source"]
+            return data
+    raise RuntimeError("AI could not produce a valid script after 3 attempts")
 
 
 # ---------- voice ----------
@@ -205,27 +292,15 @@ _KP = None
 
 
 def init_tts():
-    """Try Kokoro (natural, free, local). Fall back to Piper if it can't load."""
-    try:
-        import kokoro  # noqa: F401
-    except ImportError:
-        if os.getenv("GITHUB_ACTIONS"):
-            try:
-                subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "espeak-ng"], check=False)
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "torch",
-                                "--index-url", "https://download.pytorch.org/whl/cpu"], check=True)
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kokoro>=0.9.4",
-                                "soundfile"], check=True)
-            except Exception as e:
-                print("Kokoro install failed:", e)
     try:
         from kokoro import KPipeline
         global _KP
         _KP = KPipeline(lang_code="a")
         CFG["engine"] = "kokoro"
-    except Exception as e:
-        print("Kokoro unavailable, using Piper:", e)
-        CFG["engine"] = "piper"
+        return
+    except Exception as exc:
+        print("Kokoro unavailable; trying Piper:", exc)
+    CFG["engine"] = "piper"
 
 
 def tts(text, wav):
@@ -235,42 +310,46 @@ def tts(text, wav):
         chunks = []
         for _, _, audio in _KP(text, voice=CFG["voice"], speed=CFG["speed"]):
             chunks.append(audio.numpy() if hasattr(audio, "numpy") else audio)
+        if not chunks:
+            raise RuntimeError("Kokoro returned no audio")
         sf.write(str(wav), np.concatenate(chunks), 24000)
     else:
-        run([CFG["piper_bin"], "--model", CFG["piper_model"], "--length_scale", "0.85",
+        run([CFG["piper_bin"], "--model", CFG["piper_model"], "--length_scale", "0.88",
              "--output_file", str(wav)], input=text)
 
 
-def voice_beats(beats, d):
-    """One clip per beat so each visual cut lines up exactly with its line."""
-    durs, files = [], []
-    for i, b in enumerate(beats):
-        raw, fin = d / f"b{i}_raw.wav", d / f"b{i}.wav"
-        tts(b["text"], raw)
+def voice_beats(beats, workdir):
+    durations, files = [], []
+    for i, beat in enumerate(beats):
+        raw, final = workdir / f"b{i}_raw.wav", workdir / f"b{i}.wav"
+        tts(beat["text"], raw)
         run(["ffmpeg", "-y", "-i", str(raw), "-ar", "24000", "-ac", "1",
-             "-af", "apad=pad_dur=0.06", str(fin)])
-        raw.unlink()
-        durs.append(probe_duration(fin))
-        files.append(fin)
-    (d / "vlist.txt").write_text("".join(f"file '{f.name}'\n" for f in files))
-    run(["ffmpeg", "-y", "-f", "concat", "-i", "vlist.txt", "-c", "copy", "voice.wav"], cwd=d)
-    return durs
+             "-af", "apad=pad_dur=0.06", str(final)])
+        raw.unlink(missing_ok=True)
+        durations.append(probe_duration(final))
+        files.append(final)
+    (workdir / "vlist.txt").write_text(
+        "".join(f"file '{f.name}'\n" for f in files), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "vlist.txt",
+         "-c", "copy", "voice.wav"], cwd=workdir)
+    return durations
 
 
-# ---------- captions: one big word at a time ----------
+# ---------- captions ----------
 def transcribe_words(wav):
     from faster_whisper import WhisperModel
     model = WhisperModel(CFG["whisper_model"], device="cpu", compute_type="int8")
-    segs, _ = model.transcribe(str(wav), word_timestamps=True)
-    return [(w.word.strip(), w.start, w.end) for s in segs for w in s.words if w.word.strip()]
+    segments, _ = model.transcribe(str(wav), word_timestamps=True)
+    return [(w.word.strip(), w.start, w.end)
+            for segment in segments for w in (segment.words or []) if w.word.strip()]
 
 
-def ass_time(s):
-    return f"{int(s // 3600)}:{int(s % 3600 // 60):02d}:{s % 60:05.2f}"
+def ass_time(seconds):
+    return f"{int(seconds // 3600)}:{int(seconds % 3600 // 60):02d}:{seconds % 60:05.2f}"
 
 
-def write_ass(words, beats, durs, ep, path):
-    head = (
+def write_ass(words, beats, durations, ep, path):
+    header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n"
         "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,"
         "BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,"
@@ -280,235 +359,291 @@ def write_ass(words, beats, durs, ep, path):
         "Style: Label,@F,74,&H00FFFFFF,&H000000FF,&H003030E0,&H00000000,-1,0,0,0,100,100,0,0,3,14,0,8,60,60,60,1\n\n"
         "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
     ).replace("@F", CFG["font"])
-    total = sum(durs)
-    ev = [f"Dialogue: 0,{ass_time(0)},{ass_time(total)},Head,,0,0,0,,"
-          f"{{\\an8\\pos(540,170)}}{SERIES_NAME.upper()}  |  EP {ep}"]
-    t = 0.0
-    for b, d in zip(beats, durs):
-        if b.get("label"):
-            ev.append(f"Dialogue: 0,{ass_time(t)},{ass_time(t + d)},Label,,0,0,0,,"
-                      f"{{\\an8\\pos(540,290)}}{b['label']}")
-        t += d
+    total = sum(durations)
+    events = [f"Dialogue: 0,{ass_time(0)},{ass_time(total)},Head,,0,0,0,,"
+              f"{{\\an8\\pos(540,170)}}{SERIES_NAME.upper()}  |  EP {ep}"]
+    current = 0.0
+    for beat, duration in zip(beats, durations):
+        if beat.get("label"):
+            safe_label = re.sub(r"[{}\\]", "", beat["label"])
+            events.append(f"Dialogue: 0,{ass_time(current)},{ass_time(current + duration)},Label,,0,0,0,,"
+                          f"{{\\an8\\pos(540,290)}}{safe_label}")
+        current += duration
     pop = "\\fscx85\\fscy85\\t(0,90,\\fscx108\\fscy108)\\t(90,150,\\fscx100\\fscy100)"
-    for i, (w, s, e) in enumerate(words):
-        nxt = words[i + 1][1] if i + 1 < len(words) else None
-        end = nxt if nxt is not None and nxt - e < 0.4 else e + 0.05
-        if end <= s:
-            end = s + 0.1
-        txt = re.sub(r"[{}\\]", "", w).upper()
-        ev.append(f"Dialogue: 1,{ass_time(s)},{ass_time(end)},Word,,0,0,0,,"
-                  f"{{\\an5\\pos(540,1130){pop}}}{txt}")
-    path.write_text(head + "\n".join(ev) + "\n", encoding="utf-8")
+    for i, (word, start, end) in enumerate(words):
+        next_start = words[i + 1][1] if i + 1 < len(words) else None
+        finish = next_start if next_start is not None and next_start - end < 0.4 else end + 0.05
+        finish = max(finish, start + 0.1)
+        safe_word = re.sub(r"[{}\\]", "", word).upper()
+        events.append(f"Dialogue: 1,{ass_time(start)},{ass_time(finish)},Word,,0,0,0,,"
+                      f"{{\\an5\\pos(540,1130){pop}}}{safe_word}")
+    path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
 
-# ---------- visuals: a new stock clip for every beat ----------
+# ---------- stock footage ----------
 def pexels_candidates(query):
-    r = requests.get("https://api.pexels.com/videos/search",
-                     headers={"Authorization": os.environ["PEXELS_API_KEY"]},
-                     params={"query": query, "orientation": "portrait", "per_page": 15}, timeout=30)
-    r.raise_for_status()
-    out = []
-    for v in r.json().get("videos", []):
-        files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4"
-                 and (f.get("width") or 0) >= 720 and (f.get("height") or 0) > (f.get("width") or 0)]
+    key = os.getenv("PEXELS_API_KEY")
+    if not key:
+        return []
+    response = SESSION.get("https://api.pexels.com/videos/search",
+                          headers={"Authorization": key},
+                          params={"query": query, "orientation": "portrait", "per_page": 15},
+                          timeout=30)
+    response.raise_for_status()
+    results = []
+    for video in response.json().get("videos", []):
+        files = [f for f in video.get("video_files", [])
+                 if f.get("file_type") == "video/mp4" and (f.get("height") or 0) > (f.get("width") or 0)]
         if files:
-            f = min(files, key=lambda f: abs(f["width"] - 1080))
-            out.append((f["link"], v.get("url")))
-    return out
+            chosen = min(files, key=lambda f: abs((f.get("width") or 0) - 1080))
+            results.append((chosen["link"], video.get("url")))
+    return results
 
 
 def pixabay_candidates(query):
-    r = requests.get("https://pixabay.com/api/videos/",
-                     params={"key": os.environ["PIXABAY_API_KEY"], "q": query[:100],
-                             "per_page": 20, "safesearch": "true", "video_type": "film"}, timeout=30)
-    r.raise_for_status()
-    out = []
-    for h in r.json().get("hits", []):
-        vids = h.get("videos", {})
-        pick = next((vids[k] for k in ("medium", "small", "large") if vids.get(k, {}).get("url")), None)
-        if pick:
-            out.append((pick["url"], h.get("pageURL")))
-    return out
+    key = os.getenv("PIXABAY_API_KEY")
+    if not key:
+        return []
+    response = SESSION.get("https://pixabay.com/api/videos/",
+                           params={"key": key, "q": query[:100], "per_page": 20,
+                                   "safesearch": "true", "video_type": "film"},
+                           timeout=30)
+    response.raise_for_status()
+    results = []
+    for hit in response.json().get("hits", []):
+        videos = hit.get("videos", {})
+        chosen = next((videos[k] for k in ("medium", "small", "large")
+                       if videos.get(k, {}).get("url")), None)
+        if chosen:
+            results.append((chosen["url"], hit.get("pageURL")))
+    return results
 
 
-def download(link, path):
-    with requests.get(link, stream=True, timeout=90) as resp:
-        resp.raise_for_status()
-        with path.open("wb") as fh:
-            for chunk in resp.iter_content(1 << 20):
-                fh.write(chunk)
+def download(url, path):
+    with SESSION.get(url, stream=True, timeout=(20, 120)) as response:
+        response.raise_for_status()
+        with path.open("wb") as handle:
+            for chunk in response.iter_content(1 << 20):
+                if chunk:
+                    handle.write(chunk)
+    if not path.exists() or path.stat().st_size < 10_000:
+        raise RuntimeError(f"Downloaded footage is empty or too small: {path.name}")
 
 
-def make_seg(raw, dur, out):
-    """Crop to 9:16 with a slight random punch-in, boosted colour, exact beat length."""
-    rd = probe_duration(raw)
-    start = random.uniform(0, max(0.0, rd - dur - 0.2))
-    jx, jy = random.randint(-50, 50), random.randint(-90, 90)
+def make_segment(raw, duration, output):
+    raw_duration = probe_duration(raw)
+    if raw_duration <= 0:
+        raise RuntimeError(f"Invalid source video duration: {raw}")
+    start = random.uniform(0, max(0.0, raw_duration - min(duration, raw_duration)))
+    x, y = random.randint(-35, 35), random.randint(-60, 60)
     vf = (f"scale=1188:2112:force_original_aspect_ratio=increase,"
-          f"crop=1080:1920:(iw-1080)/2+({jx}):(ih-1920)/2+({jy}),"
-          "eq=saturation=1.3:contrast=1.08,setsar=1,fps=30")
-    run(["ffmpeg", "-y", "-ss", f"{start:.2f}", "-stream_loop", "-1", "-i", str(raw), "-an",
-         "-t", f"{dur:.2f}", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-         "-pix_fmt", "yuv420p", str(out)])
+          f"crop=1080:1920:(iw-1080)/2+({x}):(ih-1920)/2+({y}),"
+          "eq=saturation=1.18:contrast=1.06,setsar=1,fps=30")
+    run(["ffmpeg", "-y", "-ss", f"{start:.2f}", "-stream_loop", "-1", "-i", str(raw),
+         "-an", "-t", f"{duration:.2f}", "-vf", vf, "-c:v", "libx264",
+         "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", str(output)])
 
 
-def build_background(beats, durs, d):
-    use_api = bool(os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY"))
-    search = pixabay_candidates if os.getenv("PIXABAY_API_KEY") else pexels_candidates
+def build_background(beats, durations, workdir):
     local = pick_files(ROOT / "footage", VIDEO_EXT)
-    pool, used, sources, segs = [], set(), [], []
-    for i, (b, dur) in enumerate(zip(beats, durs)):
+    downloaded, used_urls, sources, segments = [], set(), [], []
+    providers = []
+    if os.getenv("PIXABAY_API_KEY"):
+        providers.append(pixabay_candidates)
+    if os.getenv("PEXELS_API_KEY"):
+        providers.append(pexels_candidates)
+
+    for i, (beat, duration) in enumerate(zip(beats, durations)):
         raw = None
-        if use_api:
+        for provider in providers:
             try:
-                cands = [c for c in search(b["visual"]) if c[0] not in used]
-                if not cands:
-                    cands = [c for c in search(b["visual"].split()[0]) if c[0] not in used]
-                if cands:
-                    link, page = random.choice(cands[:8])
-                    raw = d / f"raw{i}.mp4"
-                    download(link, raw)
-                    used.add(link)
-                    pool.append(raw)
+                candidates = [item for item in provider(beat["visual"]) if item[0] not in used_urls]
+                if not candidates:
+                    candidates = [item for item in provider(beat["visual"].split()[0]) if item[0] not in used_urls]
+                if candidates:
+                    url, page = random.choice(candidates[:8])
+                    candidate_path = workdir / f"raw{i}.mp4"
+                    download(url, candidate_path)
+                    raw = candidate_path
+                    downloaded.append(raw)
+                    used_urls.add(url)
                     sources.append(page)
-            except Exception as e:
-                print(f"Footage search failed for '{b['visual']}': {e}")
-                raw = None
-        if raw is None and pool:
-            raw = random.choice(pool)
+                    break
+            except Exception as exc:
+                print(f"Footage provider failed for '{beat['visual']}': {exc}")
+        if raw is None and downloaded:
+            raw = random.choice(downloaded)
         if raw is None and local:
             raw = random.choice(local)
         if raw is None:
-            raise RuntimeError(f"No footage for beat {i + 1} ('{b['visual']}')")
-        seg = d / f"seg{i}.mp4"
-        make_seg(raw, dur, seg)
-        segs.append(seg)
-    (d / "list.txt").write_text("".join(f"file '{s.name}'\n" for s in segs))
-    run(["ffmpeg", "-y", "-f", "concat", "-i", "list.txt", "-c", "copy", "bg.mp4"], cwd=d)
-    return d / "bg.mp4", sources
+            raise RuntimeError(
+                f"No footage for beat {i + 1}. Add a working Pixabay/PEXELS key or licensed clips in /footage."
+            )
+        segment = workdir / f"seg{i}.mp4"
+        make_segment(raw, duration, segment)
+        segments.append(segment)
+
+    (workdir / "segments.txt").write_text(
+        "".join(f"file '{segment.name}'\n" for segment in segments), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "segments.txt",
+         "-c", "copy", "background.mp4"], cwd=workdir)
+    return workdir / "background.mp4", sources
 
 
-def render(bg, start, wav, workdir, out_mp4, dur):
-    music = pick_files(ROOT / "music", AUDIO_EXT)
-    track = random.choice(music) if music else None
-    cmd = ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-stream_loop", "-1", "-i", str(bg), "-i", str(wav)]
-    vf = "[0:v]ass=captions.ass[v];"
-    if track:
-        cmd += ["-stream_loop", "-1", "-i", str(track)]
-        af = (f"[2:a]volume={CFG['music_volume']}[m];[1:a][m]amix=inputs=2:duration=first:"
-              "dropout_transition=0:normalize=0[a]")
+def render(background, voice, workdir, output, duration):
+    music_files = pick_files(ROOT / "music", AUDIO_EXT)
+    music = random.choice(music_files) if music_files else None
+    command = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(background), "-i", str(voice)]
+    video_filter = "[0:v]ass=captions.ass[v];"
+    if music:
+        command += ["-stream_loop", "-1", "-i", str(music)]
+        audio_filter = (f"[2:a]volume={CFG['music_volume']}[m];"
+                        "[1:a][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
     else:
-        af = "[1:a]anull[a]"
-    cmd += ["-filter_complex", vf + af, "-map", "[v]", "-map", "[a]", "-t", f"{dur + 0.3:.2f}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out_mp4)]
-    run(cmd, cwd=workdir)  # cwd=workdir so captions.ass needs no path escaping
-    return track.name if track else None
+        audio_filter = "[1:a]anull[a]"
+    command += ["-filter_complex", video_filter + audio_filter,
+                "-map", "[v]", "-map", "[a]", "-t", f"{duration + 0.25:.2f}",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(output)]
+    run(command, cwd=workdir)
+    return music.name if music else None
 
 
-# ---------- one full episode ----------
-def make_video(idx):
-    state = load_state()
-    n = len(state["episodes"]) + 1
-    data = write_episode(n, state)
-    beats = data["beats"]
-    d = OUT_DAY / f"{idx:02d}_ep{n}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "script.txt").write_text("\n".join(f"[{b['label']}] {b['text']}" for b in beats),
-                                  encoding="utf-8")
-    durs = voice_beats(beats, d)
-    total = sum(durs)
-    words = transcribe_words(d / "voice.wav")
-    write_ass(words, beats, durs, n, d / "captions.ass")
-    bg, sources = build_background(beats, durs, d)
-    track = render(bg, 0.0, d / "voice.wav", d, d / "video.mp4", total)
-    for pattern in ("raw*.mp4", "seg*.mp4", "b*.wav", "list.txt", "vlist.txt", "bg.mp4"):
-        for p in d.glob(pattern):
-            p.unlink()
-    meta = {"episode": n, "series": SERIES_NAME, "title": data["title"],
-            "description": data.get("description", "") + "\n\nFictional comedy series. #Shorts",
-            "tags": data.get("tags", []), "duration_sec": round(total, 1),
-            "voice_engine": CFG["engine"], "footage_sources": sources, "music_used": track,
-            "review_checklist": ["Fact-check any real facts", "Footage/music license OK",
-                                 "Turn on YouTube's altered/synthetic content disclosure if needed"]}
-    (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    state["episodes"].append({"ep": n, "title": data["title"], "summary": data.get("summary", "")})
+# ---------- episode ----------
+def make_video(index, state, candidates):
+    trend = choose_topic(candidates, state)
+    episode_number = len(state["episodes"]) + 1
+    data = write_episode(episode_number, state, trend)
+    workdir = OUT_DAY / f"{index:02d}_ep{episode_number}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / "script.txt").write_text(
+        "\n".join(f"[{b['label']}] {b['text']}" for b in data["beats"]), encoding="utf-8")
+    durations = voice_beats(data["beats"], workdir)
+    total = sum(durations)
+    words = transcribe_words(workdir / "voice.wav")
+    write_ass(words, data["beats"], durations, episode_number, workdir / "captions.ass")
+    background, sources = build_background(data["beats"], durations, workdir)
+    music = render(background, workdir / "voice.wav", workdir,
+                   workdir / "video.mp4", total)
+    video_path = workdir / "video.mp4"
+    if not video_path.exists() or video_path.stat().st_size < 50_000:
+        raise RuntimeError("Rendered MP4 is missing or unexpectedly small")
+
+    metadata = {
+        "episode": episode_number, "series": SERIES_NAME,
+        "topic": data["topic"], "trend_signal_source": data["trend_source"],
+        "title": data["title"], "description": data.get("description", "") +
+        "\n\nOriginal AI-assisted commentary. Verify facts and footage rights before publishing. #Shorts",
+        "tags": data.get("tags", []), "duration_sec": round(total, 1),
+        "voice_engine": CFG["engine"], "footage_sources": sources, "music_used": music,
+        "review_checklist": [
+            "Check factual claims and spelling",
+            "Confirm stock footage and music license terms",
+            "Review platform rules and synthetic-content disclosure requirements",
+            "Review the finished video before publishing",
+        ],
+    }
+    (workdir / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    # Only mark a topic used after the MP4 has successfully rendered.
+    state["used_topics"].append(data["topic"])
+    state["episodes"].append({
+        "ep": episode_number, "topic": data["topic"],
+        "title": data["title"], "summary": data.get("summary", ""),
+    })
     save_state(state)
-    return str(d), data["title"]
+
+    # Remove large intermediate video/audio segments; retain final video and review files.
+    for pattern in ("raw*.mp4", "seg*.mp4", "b*.wav", "segments.txt",
+                    "vlist.txt", "background.mp4", "voice.wav"):
+        for path in workdir.glob(pattern):
+            path.unlink(missing_ok=True)
+    return str(workdir), data["title"]
 
 
-# ---------- run, report, notify ----------
+# ---------- reports and notifications ----------
 def preflight():
-    errs = []
+    errors = []
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            errs.append(f"'{tool}' not found in PATH")
-    if CFG["engine"] == "piper":
-        if not (shutil.which(CFG["piper_bin"]) or Path(CFG["piper_bin"]).exists()):
-            errs.append(f"Kokoro failed and Piper not found: {CFG['piper_bin']}")
-        elif not Path(CFG["piper_model"]).exists():
-            errs.append(f"Piper voice model missing: {CFG['piper_model']}")
-    if not (os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY")) \
-            and not pick_files(ROOT / "footage", VIDEO_EXT):
-        errs.append("No footage: set PIXABAY_API_KEY or add licensed clips to /footage")
+            errors.append(f"'{tool}' not found in PATH")
     if not os.getenv("GEMINI_API_KEY"):
         try:
-            requests.get(CFG["ollama_url"].rsplit("/api", 1)[0], timeout=5)
+            SESSION.get(CFG["ollama_url"].rsplit("/api", 1)[0], timeout=5)
         except Exception:
-            errs.append("No GEMINI_API_KEY and Ollama is not running")
-    return errs
+            errors.append("Missing GEMINI_API_KEY and Ollama is not running")
+    if not os.getenv("PIXABAY_API_KEY") and not os.getenv("PEXELS_API_KEY") \
+            and not pick_files(ROOT / "footage", VIDEO_EXT):
+        errors.append("No footage source configured: add PIXABAY_API_KEY/PEXELS_API_KEY or clips in /footage")
+    if CFG["engine"] == "piper":
+        if not (shutil.which(CFG["piper_bin"]) or Path(CFG["piper_bin"]).exists()):
+            errors.append(f"Piper executable not found: {CFG['piper_bin']}")
+        if not Path(CFG["piper_model"]).exists():
+            errors.append(f"Piper model missing: {CFG['piper_model']}")
+    return errors
 
 
-def notify(text):
-    tok, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if tok and chat:
+def notify(message):
+    token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat:
         try:
-            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          json={"chat_id": chat, "text": text[:4000]}, timeout=15)
-        except Exception:
-            pass
+            SESSION.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                         json={"chat_id": chat, "text": message[:4000]}, timeout=20).raise_for_status()
+        except Exception as exc:
+            print(f"Telegram text notification failed: {exc}")
 
 
 def notify_video(path, caption):
-    tok, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if tok and chat:
+    token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat:
         try:
-            with open(path, "rb") as fh:
-                requests.post(f"https://api.telegram.org/bot{tok}/sendVideo",
-                              data={"chat_id": chat, "caption": caption[:900]},
-                              files={"video": fh}, timeout=180)
-        except Exception:
-            pass
+            with open(path, "rb") as handle:
+                response = SESSION.post(
+                    f"https://api.telegram.org/bot{token}/sendVideo",
+                    data={"chat_id": chat, "caption": caption[:900]},
+                    files={"video": handle}, timeout=(30, 240))
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"Telegram video delivery failed: {exc}")
 
 
 def main():
     OUT_DAY.mkdir(parents=True, exist_ok=True)
+    state = load_state()
     done, errors = [], []
     init_tts()
-    errors += preflight()
+    errors.extend(preflight())
     if not errors:
-        start_idx = len([p for p in OUT_DAY.iterdir() if p.is_dir()]) + 1
-        for i in range(CFG["videos_per_run"]):
+        candidates = get_trend_candidates()
+        print(f"Found {len(candidates)} live trend candidates.")
+        start_index = len([p for p in OUT_DAY.iterdir() if p.is_dir()]) + 1
+        for offset in range(CFG["videos_per_run"]):
             try:
-                path, title = make_video(start_idx + i)
+                path, title = make_video(start_index + offset, state, candidates)
                 done.append((title, path))
                 notify_video(Path(path) / "video.mp4", title)
-            except Exception as e:
-                errors.append(f"video {i + 1}: {e}")
-                (OUT_DAY / "errors.log").open("a").write(traceback.format_exc() + "\n")
-    report = [f"# Daily report {TODAY}",
-              f"Completed: {len(done)}  |  Errors: {len(errors)}  |  Voice: {CFG['engine']}", ""]
-    report += [f"- OK: {t} -> {p}" for t, p in done]
-    report += [f"- ERROR: {e}" for e in errors]
-    report.append("\nNext step: review each folder's video.mp4 + meta.json, then upload manually.")
-    text = "\n".join(report)
-    with (OUT_DAY / "report.md").open("a", encoding="utf-8") as f:
-        f.write(text + "\n\n")
-    print(text)
-    notify(text)
+            except Exception as exc:
+                errors.append(f"Video {offset + 1}: {type(exc).__name__}: {exc}")
+                with (OUT_DAY / "errors.log").open("a", encoding="utf-8") as handle:
+                    handle.write(traceback.format_exc() + "\n")
+    report_lines = [
+        f"# Daily report {TODAY}",
+        f"Completed: {len(done)} | Errors: {len(errors)} | Voice: {CFG['engine']}",
+        f"Trend candidates discovered: {len(get_trend_candidates()) if not errors else 'not checked'}",
+        "",
+    ]
+    report_lines += [f"- OK: {title} -> {path}" for title, path in done]
+    report_lines += [f"- ERROR: {error}" for error in errors]
+    report_lines.append("\nNext step: review each video's MP4 and meta.json before publishing.")
+    report = "\n".join(report_lines)
+    with (OUT_DAY / "report.md").open("a", encoding="utf-8") as handle:
+        handle.write(report + "\n\n")
+    print(report)
+    notify(report)
+    if errors and not done:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
     main()
-EOF
-python3 -m py_compile pipeline.py && echo COMPILED
