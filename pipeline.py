@@ -63,7 +63,8 @@ def gemini_models(key):
 
     def rank(n):
         v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-        return ("lite" in n, "preview" in n or "exp" in n, -(float(v.group(1)) if v else 0))
+        # stable before preview; lite first (fast, no slow "thinking"), then newest version
+        return ("preview" in n or "exp" in n, "lite" not in n, -(float(v.group(1)) if v else 0))
     return sorted(names, key=rank)
 
 
@@ -86,14 +87,24 @@ def llm_json(prompt):
         last = "no models found"
         for model in cands:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            r = None
             for _ in range(3):
-                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+                try:
+                    r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=75)
+                except requests.exceptions.RequestException as e:
+                    last = f"{model}: {type(e).__name__}"
+                    print(f"Gemini {last}, trying next model")
+                    r = None
+                    break
                 if r.status_code == 429:  # free-tier rate limit: wait and retry
                     time.sleep(25)
                     continue
                 break
-            if r.status_code in (400, 403, 404, 429):
+            if r is None:
+                continue
+            if r.status_code in (400, 403, 404, 429, 500, 503):
                 last = f"{model}: HTTP {r.status_code}"
+                print(f"Gemini {last}, trying next model")
                 continue
             r.raise_for_status()
             _GEMINI_OK = model
