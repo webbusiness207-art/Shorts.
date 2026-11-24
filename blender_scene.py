@@ -43,10 +43,15 @@ def setup_render():
         # EEVEE needs an OpenGL context, which headless CI runners don't have.
         # Cycles on CPU works everywhere.
         scene.cycles.device = 'CPU'
-        scene.cycles.samples = int(os.environ.get('BLENDER_SAMPLES', '24'))
+        scene.cycles.samples = int(os.environ.get('BLENDER_SAMPLES', '32'))
+        # Ubuntu's Blender is built without OpenImageDenoise, and asking for
+        # it makes the render fail, so denoising stays off.
         try:
-            scene.cycles.use_denoising = True
-            scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+            scene.cycles.use_denoising = False
+        except Exception:
+            pass
+        try:
+            scene.cycles.use_adaptive_sampling = True
         except Exception:
             pass
     else:
