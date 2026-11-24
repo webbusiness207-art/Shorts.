@@ -1,48 +1,63 @@
 {
- "episodes": [
-  {
-   "ep": 1,
-   "topic": "cruise ship",
-   "title": "How Cruise Ships Convert Ocean Water",
-   "summary": "An inside look at the hidden water filtration and waste management systems aboard mega cruise ships."
-  },
-  {
-   "ep": 2,
-   "topic": "grand theft auto",
-   "title": "How a Coding Glitch Created Grand Theft Auto",
-   "summary": "Grand Theft Auto was born when a police AI bug in a failing racing game turned unintentional car chases into peak entertainment."
-  },
-  {
-   "ep": 3,
-   "topic": "vanity fair taylor swift",
-   "title": "How Taylor Swift Hides Easter Eggs on Magazine Covers",
-   "summary": "An exploration of how Taylor Swift utilizes magazine photoshoots to secretly signal future album eras and announcements."
-  },
-  {
-   "ep": 4,
-   "title": "What If I Built A Jet Powered Lawn Mower",
-   "summary": "Kevin decides to install a jet engine on a lawn mower, resulting in neighborhood destruction and a suspicious pigeon witness."
-  },
-  {
-   "ep": 5,
-   "title": "Kevin Builds A Super-Sonic Toaster",
-   "summary": "Kevin turns his kitchen into a disaster zone by modifying a toaster with high-intensity lasers."
-  },
-  {
-   "ep": 6,
-   "title": "Kevin Experiments With Earthquake Shoes",
-   "summary": "Kevin attempts to walk through walls by building sonic-vibration shoes but ends up triggering a city-wide seismic event."
-  }
- ],
- "used_topics": [
-  "Why astronauts' bones physically shrink in space and how Earth's gravity holds us together",
-  "The terrifying truth about what happens if you fall into a black hole's event horizon",
-  "Why time moves differently at the top of a skyscraper compared to the ground",
-  "why a spoonful of a neutron star weighs as much as Mount Everest and what it would do to your hand",
-  "the terrifying sound of the sun captured by NASA and why sound cannot travel through the vacuum of space",
-  "what happens to the human body if you step outside in space without a spacesuit in the freezing vacuum",
-  "cruise ship",
-  "grand theft auto",
-  "vanity fair taylor swift"
- ]
+  "episodes": [
+    {
+      "ep": 1,
+      "topic": "cruise ship",
+      "title": "How Cruise Ships Convert Ocean Water",
+      "summary": "An inside look at the hidden water filtration and waste management systems aboard mega cruise ships."
+    },
+    {
+      "ep": 2,
+      "topic": "grand theft auto",
+      "title": "How a Coding Glitch Created Grand Theft Auto",
+      "summary": "Grand Theft Auto was born when a police AI bug in a failing racing game turned unintentional car chases into peak entertainment."
+    },
+    {
+      "ep": 3,
+      "topic": "vanity fair taylor swift",
+      "title": "How Taylor Swift Hides Easter Eggs on Magazine Covers",
+      "summary": "An exploration of how Taylor Swift utilizes magazine photoshoots to secretly signal future album eras and announcements."
+    },
+    {
+      "ep": 4,
+      "title": "What If I Built A Jet Powered Lawn Mower",
+      "summary": "Kevin decides to install a jet engine on a lawn mower, resulting in neighborhood destruction and a suspicious pigeon witness."
+    },
+    {
+      "ep": 5,
+      "title": "Kevin Builds A Super-Sonic Toaster",
+      "summary": "Kevin turns his kitchen into a disaster zone by modifying a toaster with high-intensity lasers."
+    },
+    {
+      "ep": 6,
+      "title": "Kevin Experiments With Earthquake Shoes",
+      "summary": "Kevin attempts to walk through walls by building sonic-vibration shoes but ends up triggering a city-wide seismic event."
+    },
+    {
+      "ep": 7,
+      "title": "Kevin's Tornado Vacuum",
+      "summary": "Kevin straps a jet turbine to a household vacuum and accidentally creates an indoor tornado."
+    },
+    {
+      "ep": 8,
+      "title": "Kevin's Gravity Boots",
+      "summary": "Kevin launches himself into the ceiling using DIY magnetic boots."
+    },
+    {
+      "ep": 9,
+      "title": "Kevin's Laser Haircut Helmet",
+      "summary": "Kevin tries a laser haircut helmet that instantly blasts all his hair off."
+    }
+  ],
+  "used_topics": [
+    "Why astronauts' bones physically shrink in space and how Earth's gravity holds us together",
+    "The terrifying truth about what happens if you fall into a black hole's event horizon",
+    "Why time moves differently at the top of a skyscraper compared to the ground",
+    "why a spoonful of a neutron star weighs as much as Mount Everest and what it would do to your hand",
+    "the terrifying sound of the sun captured by NASA and why sound cannot travel through the vacuum of space",
+    "what happens to the human body if you step outside in space without a spacesuit in the freezing vacuum",
+    "cruise ship",
+    "grand theft auto",
+    "vanity fair taylor swift"
+  ]
 }
