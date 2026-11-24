@@ -20,51 +20,60 @@
     },
     {
       "ep": 4,
+      "topic": "jet powered lawn mower",
       "title": "What If I Built A Jet Powered Lawn Mower",
       "summary": "Kevin decides to install a jet engine on a lawn mower, resulting in neighborhood destruction and a suspicious pigeon witness."
     },
     {
       "ep": 5,
+      "topic": "super-sonic toaster",
       "title": "Kevin Builds A Super-Sonic Toaster",
       "summary": "Kevin turns his kitchen into a disaster zone by modifying a toaster with high-intensity lasers."
     },
     {
       "ep": 6,
+      "topic": "earthquake shoes",
       "title": "Kevin Experiments With Earthquake Shoes",
       "summary": "Kevin attempts to walk through walls by building sonic-vibration shoes but ends up triggering a city-wide seismic event."
     },
     {
       "ep": 7,
+      "topic": "tornado vacuum",
       "title": "Kevin's Tornado Vacuum",
       "summary": "Kevin straps a jet turbine to a household vacuum and accidentally creates an indoor tornado."
     },
     {
       "ep": 8,
+      "topic": "gravity boots",
       "title": "Kevin's Gravity Boots",
       "summary": "Kevin launches himself into the ceiling using DIY magnetic boots."
     },
     {
       "ep": 9,
+      "topic": "laser haircut helmet",
       "title": "Kevin's Laser Haircut Helmet",
       "summary": "Kevin tries a laser haircut helmet that instantly blasts all his hair off."
     },
     {
       "ep": 10,
+      "topic": "motel safe code",
       "title": "The Motel Safe Code Disaster",
       "summary": "Kevin misinterprets a motel safe instructions poster and tries to crack it using fruit peels."
     },
     {
       "ep": 11,
+      "topic": "nhl supermarket skating",
       "title": "Kevin Becomes An NHL Star",
       "summary": "Kevin straps ice skates on inside a supermarket to mimic a hockey superstar, causing instant dairy aisle chaos."
     },
     {
       "ep": 12,
+      "topic": "garden gnome peace treaty",
       "title": "Kevin's Peace Treaty Negotiation",
       "summary": "Kevin attempts to resolve a territorial dispute using garden gnomes, alarming Dave and a local pigeon."
     }
   ],
-  "used_topics": [
+  "topics": [
     "Why astronauts' bones physically shrink in space and how Earth's gravity holds us together",
     "The terrifying truth about what happens if you fall into a black hole's event horizon",
     "Why time moves differently at the top of a skyscraper compared to the ground",
@@ -73,11 +82,17 @@
     "what happens to the human body if you step outside in space without a spacesuit in the freezing vacuum",
     "cruise ship",
     "grand theft auto",
-    "vanity fair taylor swift"
-  ],
-  "topics": [
+    "vanity fair taylor swift",
     "motel safe code",
     "quinn hughes",
-    "geopolitical confusion"
+    "geopolitical confusion",
+    "jet powered lawn mower",
+    "super-sonic toaster",
+    "earthquake shoes",
+    "tornado vacuum",
+    "gravity boots",
+    "laser haircut helmet",
+    "nhl supermarket skating",
+    "garden gnome peace treaty"
   ]
 }
