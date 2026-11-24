@@ -1174,33 +1174,21 @@ def make_video(index):
     write_ass(words, beats, durations, episode_number, folder / "captions.ass")
 
     print("Rendering animated scenes...")
-    if CFG["visuals"] == "blender":
-    background, sources = blender_background(
-        beats, durations, folder
-    )
-elif CFG["visuals"] == "toon":
-    background, sources = toon_background(
-        beats, durations, folder
-    )
-elif CFG["visuals"] == "stock":
-    background, sources = build_background(
-        beats, durations, folder
-    )
-else:
-    raise ValueError(
-        "VISUALS must be 'blender', 'toon', or 'stock'."
-)
-elif CFG["visuals"] == "toon":
-    background, sources = toon_background(
-        beats, durations, folder
-    )
-elif CFG["visuals"] == "stock":
-    background, sources = build_background(
-        beats, durations, folder
-    )
-else:
-    raise ValueError(
-        "VISUALS must be 'blender', 'toon', or 'stock'."
+        if CFG["visuals"] == "blender":
+        background, sources = blender_background(
+            beats, durations, folder
+        )
+    elif CFG["visuals"] == "toon":
+        background, sources = toon_background(
+            beats, durations, folder
+        )
+    elif CFG["visuals"] == "stock":
+        background, sources = build_background(
+            beats, durations, folder
+        )
+    else:
+        raise ValueError(
+            "VISUALS must be 'blender', 'toon', or 'stock'."
 )
     print("Compositing final Short...")
     music = render(
