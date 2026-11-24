@@ -1,6 +1,7 @@
 
 #!/usr/bin/env python3
-"""Shorts Factory v3 — original animated comedy Shorts."""
+"""Shorts Factory v4 — animated comedy YouTube Shorts."""
+
 import datetime as dt
 import json
 import math
@@ -16,13 +17,21 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 
-ROOT = Path(__file__).parent
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent
+
 SERIES_NAME = os.getenv("SERIES_NAME") or "KEVIN'S WORST IDEAS"
+
 DEFAULT_PREMISE = (
-    "Kevin is an overconfident, clueless guy who tries one absurd experiment "
-    "per episode. Every beat escalates. Dave warns him and is ignored. "
-    "A pigeon mysteriously watches every disaster. End on a cliffhanger."
+    "Kevin is an overconfident, clueless guy who tries one absurd "
+    "experiment per episode. Every beat escalates. Dave warns Kevin "
+    "and gets ignored. A pigeon mysteriously watches every disaster. "
+    "End on a funny cliffhanger."
 )
 
 CFG = {
@@ -32,10 +41,15 @@ CFG = {
     "speed": float(os.getenv("VOICE_SPEED") or 1.08),
     "engine": "kokoro",
     "visuals": os.getenv("VISUALS") or "toon",
-    "ollama_url": "http://localhost:11434/api/generate",
+    "ollama_url": os.getenv(
+        "OLLAMA_URL",
+        "http://localhost:11434/api/generate"
+    ),
     "ollama_model": "llama3.1:8b",
     "piper_bin": os.getenv("PIPER_BIN") or "piper",
-    "piper_model": str(ROOT / "models" / "en_US-lessac-medium.onnx"),
+    "piper_model": str(
+        ROOT / "models" / "en_US-lessac-medium.onnx"
+    ),
     "font": os.getenv("CAPTION_FONT") or "DejaVu Sans",
     "whisper_model": "small",
     "music_volume": 0.075,
@@ -45,64 +59,106 @@ CFG = {
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".ogg"}
+
 TODAY = dt.date.today().isoformat()
 OUT_DAY = ROOT / "output" / TODAY
 STATE_FILE = ROOT / "used_topics.json"
 
-# ---------- utilities ----------
+TW, TH = 720, 1280
+FPS = 30
+INK = (22, 22, 34)
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def run(cmd, **kwargs):
+    return subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        **kwargs
+    )
 
 
 def probe_duration(path):
-    r = run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1", str(path)
+    result = run([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1",
+        str(path)
     ])
-    return float(r.stdout.strip())
+    return float(result.stdout.strip())
 
 
-def pick_files(folder, exts):
+def pick_files(folder, extensions):
+    if not folder.exists():
+        return []
+
     return [
-        p for p in folder.iterdir() if p.suffix.lower() in exts
-    ] if folder.exists() else []
+        path for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in extensions
+    ]
 
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-# ---------- AI script generation ----------
+def safe_json(text):
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text)
+        text = re.sub(r"```$", "", text).strip()
+
+    return json.loads(text)
+
+
+# ============================================================
+# GEMINI AI
+# ============================================================
 
 _GEMINI_OK = None
 
 
 def gemini_models(key):
-    r = requests.get(
+    response = requests.get(
         "https://generativelanguage.googleapis.com/v1beta/models",
         headers={"x-goog-api-key": key},
         params={"pageSize": 200},
         timeout=30
     )
-    r.raise_for_status()
+
+    response.raise_for_status()
+
     names = []
 
-    for model in r.json().get("models", []):
+    for model in response.json().get("models", []):
         name = model["name"].split("/")[-1]
         supported = model.get("supportedGenerationMethods", [])
+
         if (
             "generateContent" in supported
-            and "flash" in name
+            and "flash" in name.lower()
             and not re.search(
-                r"image|tts|live|audio|embed|robotics", name
+                r"image|tts|live|audio|embed|robotics",
+                name,
+                re.I
             )
         ):
             names.append(name)
 
     def rank(name):
-        version = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        version = re.search(
+            r"gemini-(\d+(?:\.\d+)?)",
+            name
+        )
+
         number = float(version.group(1)) if version else 0
+
         return (
             "preview" in name or "exp" in name,
             "lite" not in name,
@@ -114,101 +170,172 @@ def gemini_models(key):
 
 def llm_json(prompt):
     global _GEMINI_OK
+
     key = os.getenv("GEMINI_API_KEY")
 
-    if key:
-        if _GEMINI_OK:
-            candidates = [_GEMINI_OK]
-        else:
-            candidates = []
-            if os.getenv("GEMINI_MODEL"):
-                candidates.append(os.getenv("GEMINI_MODEL"))
-            try:
-                candidates += gemini_models(key)
-            except Exception as exc:
-                print("Could not list Gemini models:", exc)
+    if not key:
+        response = requests.post(
+            CFG["ollama_url"],
+            json={
+                "model": CFG["ollama_model"],
+                "prompt": prompt,
+                "stream": False,
+                "format": "json"
+            },
+            timeout=900
+        )
 
-            candidates += [
-                "gemini-flash-latest",
-                "gemini-2.5-flash"
-            ]
-            candidates = list(dict.fromkeys(candidates))
+        response.raise_for_status()
 
-        body = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.95
+        return safe_json(response.json()["response"])
+
+    candidates = []
+
+    if _GEMINI_OK:
+        candidates.append(_GEMINI_OK)
+
+    if os.getenv("GEMINI_MODEL"):
+        candidates.append(os.getenv("GEMINI_MODEL"))
+
+    try:
+        candidates.extend(gemini_models(key))
+    except Exception as exc:
+        print("Gemini model discovery failed:", exc)
+
+    candidates.extend([
+        "gemini-2.5-flash",
+        "gemini-flash-latest"
+    ])
+
+    candidates = list(dict.fromkeys(candidates))
+
+    if not candidates:
+        raise RuntimeError("No Gemini models were found.")
+
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
             }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.85
         }
+    }
 
-        last_error = "no models found"
+    last_error = "No models worked."
 
-        for model in candidates:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent"
-            )
+    for model in candidates:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
 
-            response = None
-            for attempt in range(3):
-                try:
-                    response = requests.post(
-                        url,
-                        headers={"x-goog-api-key": key},
-                        json=body,
-                        timeout=75
+        for attempt in range(4):
+            try:
+                response = requests.post(
+                    url,
+                    headers={"x-goog-api-key": key},
+                    json=body,
+                    timeout=90
+                )
+
+                if response.status_code in (
+                    429, 500, 502, 503, 504
+                ):
+                    last_error = (
+                        f"{model}: HTTP {response.status_code}"
                     )
-                except requests.exceptions.RequestException as exc:
-                    last_error = f"{model}: {type(exc).__name__}"
+
+                    retry_after = response.headers.get("Retry-After")
+
+                    try:
+                        wait = float(retry_after)
+                    except (TypeError, ValueError):
+                        wait = min(8 * (2 ** attempt), 45)
+
+                    print(
+                        f"Gemini temporary error: {last_error}. "
+                        f"Waiting {wait:.0f} seconds."
+                    )
+
+                    if attempt < 3:
+                        time.sleep(
+                            wait + random.uniform(0, 2)
+                        )
+                        continue
+
                     break
 
-                if response.status_code == 429:
-                    time.sleep(20 * (attempt + 1))
-                    continue
+                if response.status_code in (400, 403, 404):
+                    last_error = (
+                        f"{model}: HTTP {response.status_code}"
+                    )
+                    print("Trying another model:", last_error)
+                    break
+
+                response.raise_for_status()
+
+                result = response.json()
+
+                content = (
+                    result["candidates"][0]
+                    ["content"]["parts"][0]["text"]
+                )
+
+                data = safe_json(content)
+
+                _GEMINI_OK = model
+
+                print("Using Gemini model:", model)
+
+                return data
+
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{model}: {exc}"
+
+                print("Gemini request failed:", last_error)
+
+                if attempt < 3:
+                    time.sleep(min(8 * (2 ** attempt), 45))
+
+            except (
+                KeyError,
+                IndexError,
+                json.JSONDecodeError,
+                TypeError
+            ) as exc:
+                last_error = f"{model}: Invalid response: {exc}"
                 break
 
-            if response is None:
-                continue
-
-            if response.status_code in (400, 403, 404, 429, 500, 503):
-                last_error = f"{model}: HTTP {response.status_code}"
-                print("Gemini", last_error, "- trying another model")
-                continue
-
-            response.raise_for_status()
-            _GEMINI_OK = model
-            print("Using Gemini:", model)
-
-            content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(content)
-
-        raise RuntimeError("No Gemini model worked: " + last_error)
-
-    response = requests.post(
-        CFG["ollama_url"],
-        json={
-            "model": CFG["ollama_model"],
-            "prompt": prompt,
-            "stream": False,
-            "format": "json"
-        },
-        timeout=900
+    raise RuntimeError(
+        "No Gemini model worked: " + last_error
     )
-    response.raise_for_status()
-    return json.loads(response.json()["response"])
 
 
-# ---------- series memory ----------
+# ============================================================
+# SERIES MEMORY
+# ============================================================
 
 def load_state():
     if STATE_FILE.exists():
         try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "episodes" in data:
+            data = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
+
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("episodes"), list)
+            ):
                 return data
+
         except Exception:
             pass
+
     return {"episodes": []}
 
 
@@ -225,25 +352,38 @@ def trending_hints():
             "https://trends.google.com/trending/rss?geo=US",
             timeout=20
         )
+
         response.raise_for_status()
+
         root = ET.fromstring(response.content)
+
         return [
             item.findtext("title")
             for item in root.iter("item")
+            if item.findtext("title")
         ][:10]
-    except Exception:
+
+    except Exception as exc:
+        print("Trends unavailable:", exc)
         return []
 
 
-# ---------- story and visual schema ----------
+# ============================================================
+# STORY AND VISUAL SCHEMA
+# ============================================================
 
 SCENE_NAMES = [
     "classroom", "bedroom", "kitchen", "office", "lab",
     "stage", "street", "city_night", "park", "space"
 ]
 
-EMOTIONS = ["neutral", "happy", "angry", "shock", "scared"]
-ACTIONS = ["idle", "jump", "shake", "slide", "panic", "point", "run"]
+EMOTIONS = [
+    "neutral", "happy", "angry", "shock", "scared"
+]
+
+ACTIONS = [
+    "idle", "jump", "shake", "slide", "panic", "point", "run"
+]
 
 OBJECT_NAMES = [
     "none", "phone", "box", "rocket", "car", "button",
@@ -253,19 +393,75 @@ OBJECT_NAMES = [
 ]
 
 OBJECT_ACTIONS = [
-    "idle", "bounce", "spin", "fall", "grow", "shake",
-    "fly", "explode", "slide", "drop"
+    "idle", "bounce", "spin", "fall", "grow",
+    "shake", "fly", "explode", "slide", "drop"
 ]
 
-FX_NAMES = ["none", "explosion", "fire", "sparkle", "shock"]
+FX_NAMES = [
+    "none", "explosion", "fire", "sparkle", "shock"
+]
+
+
+ROSTER = {
+    "kevin": {
+        "skin": (255, 205, 160),
+        "shirt": (255, 135, 35),
+        "pants": (48, 57, 130),
+        "hair": (85, 48, 28)
+    },
+    "dave": {
+        "skin": (225, 170, 130),
+        "shirt": (55, 135, 225),
+        "pants": (55, 55, 70),
+        "hair": (25, 25, 30),
+        "glasses": True
+    },
+    "cop": {
+        "skin": (240, 190, 150),
+        "shirt": (35, 55, 120),
+        "pants": (25, 35, 80),
+        "hair": (40, 30, 20),
+        "hat": (25, 40, 100)
+    },
+    "boss": {
+        "skin": (210, 160, 120),
+        "shirt": (95, 95, 105),
+        "pants": (60, 60, 70),
+        "hair": (170, 170, 175),
+        "tie": (210, 40, 40)
+    },
+    "kid": {
+        "skin": (250, 215, 180),
+        "shirt": (170, 90, 220),
+        "pants": (40, 40, 60),
+        "hair": (240, 200, 70)
+    },
+    "pigeon": {}
+}
+
+
+SCENES = {
+    "classroom": ((238, 216, 150), (150, 105, 70)),
+    "bedroom": ((176, 198, 240), (120, 90, 70)),
+    "kitchen": ((252, 238, 200), (196, 200, 212)),
+    "office": ((186, 212, 200), (90, 100, 122)),
+    "lab": ((58, 70, 96), (36, 42, 60)),
+    "stage": ((88, 28, 112), (62, 20, 72)),
+    "street": ((110, 196, 255), (70, 70, 82)),
+    "city_night": ((18, 18, 60), (35, 35, 65)),
+    "park": ((130, 210, 255), (96, 196, 96)),
+    "space": ((4, 4, 24), (25, 10, 55))
+}
 
 
 def clean_beat(beat):
     if not isinstance(beat, dict):
-        raise ValueError("A story beat was not a JSON object")
+        raise ValueError("A story beat was not a JSON object.")
 
     beat["text"] = str(beat.get("text") or "").strip()
-    beat["label"] = str(beat.get("label") or "").upper()[:28]
+    beat["label"] = str(
+        beat.get("label") or ""
+    ).upper()[:28]
 
     if beat.get("scene") not in SCENE_NAMES:
         beat["scene"] = "street"
@@ -274,6 +470,7 @@ def clean_beat(beat):
         beat["fx"] = "none"
 
     chars = []
+
     for char in (beat.get("chars") or [])[:3]:
         if not isinstance(char, dict):
             continue
@@ -303,6 +500,7 @@ def clean_beat(beat):
     }]
 
     objects = []
+
     for obj in (beat.get("objects") or [])[:3]:
         if not isinstance(obj, dict):
             continue
@@ -315,22 +513,27 @@ def clean_beat(beat):
         if action not in OBJECT_ACTIONS:
             action = "idle"
 
+        try:
+            size = float(obj.get("size", 1.0))
+        except (TypeError, ValueError):
+            size = 1.0
+
+        position = obj.get("position")
+
+        if position not in ("left", "center", "right"):
+            position = "center"
+
         objects.append({
             "type": kind,
             "action": action,
-            "size": clamp(
-                float(obj.get("size", 1.0)),
-                0.4,
-                2.8
-            ),
-            "position": obj.get("position")
-            if obj.get("position") in ("left", "center", "right")
-            else "center"
+            "size": clamp(size, 0.4, 2.8),
+            "position": position
         })
 
     beat["objects"] = objects
 
     visual = beat.get("visual")
+
     if not isinstance(visual, str) or not visual.strip():
         visual = beat["scene"].replace("_", " ")
 
@@ -339,7 +542,8 @@ def clean_beat(beat):
 
 def write_episode(number, state):
     history = "\n".join(
-        f"EP {episode['ep']}: {episode['title']} - "
+        f"EP {episode.get('ep')}: "
+        f"{episode.get('title')} - "
         f"{episode.get('summary', '')}"
         for episode in state["episodes"][-7:]
     ) or "No previous episodes."
@@ -347,7 +551,7 @@ def write_episode(number, state):
     trends = trending_hints()
 
     prompt = f"""
-You are the head writer of a fast, funny, animated YouTube Shorts series.
+You are the head writer of a funny animated YouTube Shorts series.
 
 SERIES: {SERIES_NAME}
 PREMISE: {CFG['premise']}
@@ -358,46 +562,48 @@ PREVIOUS EPISODES:
 OPTIONAL TREND IDEAS:
 {trends}
 
-Create episode {number}. Make the scenario genuinely different from previous
-episodes. It should feel like a funny story being told by an energetic narrator.
+Create episode {number}.
 
 STORY RULES:
 - Write 10 to 13 beats.
 - Each beat is one spoken sentence, ideally 7 to 14 words.
+- Total story should contain 90 to 145 spoken words.
 - The opening must immediately create curiosity.
 - Every beat must add a new event, twist, reaction, or escalation.
 - No slow introductions or filler.
-- Make the story understandable without needing context.
+- Make the story understandable without context.
 - Kevin is the main character.
 - Dave warns Kevin and gets ignored.
 - The pigeon appears in at least two beats.
 - End with a funny cliffhanger about Kevin's next idea.
 - Ask viewers what Kevin should try next.
-- PG comedy only. No real dangerous instructions.
+- PG comedy only.
+- Do not give real dangerous instructions.
 - Do not copy existing videos or scripts.
+- Avoid repeating previous episode ideas.
 
-VISUAL RULES — VERY IMPORTANT:
-The visuals must literally show what the narrator is describing.
+VISUAL RULES:
+The visuals must literally show what the narrator describes.
+Use concrete visible objects and actions.
 Do not use vague descriptions like "Kevin is shocked."
-Describe the actual object or event that should be visible.
 
 For every beat return:
-1. text: the exact spoken sentence.
+1. text: exact spoken sentence.
 2. scene: one of {SCENE_NAMES}.
-3. visual: a concrete description of what the viewer sees.
+3. visual: concrete description of what viewers see.
 4. chars: characters on screen.
-5. objects: actual objects visible in the scene.
+5. objects: actual objects visible.
 6. fx: visual effect.
 7. label: short on-screen text.
 
 CHARACTER OPTIONS:
 kevin, dave, cop, boss, kid, pigeon
 
-CHARACTER EMOTIONS:
-neutral, happy, angry, shock, scared
+EMOTIONS:
+{EMOTIONS}
 
 CHARACTER ACTIONS:
-idle, jump, shake, slide, panic, point, run
+{ACTIONS}
 
 OBJECT TYPES:
 {OBJECT_NAMES}
@@ -405,40 +611,47 @@ OBJECT TYPES:
 OBJECT ACTIONS:
 {OBJECT_ACTIONS}
 
-OBJECT POSITION:
+OBJECT POSITIONS:
 left, center, right
 
 EFFECTS:
 {FX_NAMES}
 
-Object examples:
-- Kevin launches a giant pancake: objects=[{{"type":"pancake","action":"fly","size":2.0,"position":"center"}}]
-- A phone starts exploding: objects=[{{"type":"phone","action":"shake","size":1.0,"position":"center"}}]
-- A giant rocket appears: objects=[{{"type":"rocket","action":"grow","size":2.0,"position":"right"}}]
-- Kevin gets rich: objects=[{{"type":"money","action":"fall","size":1.5,"position":"center"}}]
+Examples:
+Kevin launches a giant pancake:
+objects=[{{"type":"pancake","action":"fly","size":2.0,"position":"center"}}]
 
-Return valid JSON only, in this exact general structure:
+A phone shakes:
+objects=[{{"type":"phone","action":"shake","size":1.0,"position":"center"}}]
+
+A giant rocket appears:
+objects=[{{"type":"rocket","action":"grow","size":2.0,"position":"right"}}]
+
+Kevin gets rich:
+objects=[{{"type":"money","action":"fall","size":1.5,"position":"center"}}]
+
+Return valid JSON only:
 {{
- "title": "title under 60 characters",
- "description": "short description",
- "tags": ["tag1", "tag2"],
- "summary": "one sentence episode summary",
- "beats": [
-  {{
-   "text": "spoken line",
-   "scene": "kitchen",
-   "visual": "Kevin stands beside a giant pancake cannon",
-   "label": "PANCAKE MODE",
-   "fx": "sparkle",
-   "chars": [
-    {{"who":"kevin","emotion":"shock","action":"jump"}},
-    {{"who":"dave","emotion":"scared","action":"panic"}}
-   ],
-   "objects": [
-    {{"type":"pancake","action":"fly","size":2.0,"position":"center"}}
-   ]
-  }}
- ]
+"title": "title under 60 characters",
+"description": "short description",
+"tags": ["tag1", "tag2"],
+"summary": "one sentence summary",
+"beats": [
+{{
+"text": "spoken line",
+"scene": "kitchen",
+"visual": "Kevin stands beside a giant pancake cannon",
+"label": "PANCAKE MODE",
+"fx": "sparkle",
+"chars": [
+{{"who":"kevin","emotion":"shock","action":"jump"}},
+{{"who":"dave","emotion":"scared","action":"panic"}}
+],
+"objects": [
+{{"type":"pancake","action":"fly","size":2.0,"position":"center"}}
+]
+}}
+]
 }}
 """
 
@@ -451,7 +664,8 @@ Return valid JSON only, in this exact general structure:
 
         words = sum(
             len(str(beat.get("text", "")).split())
-            for beat in beats if isinstance(beat, dict)
+            for beat in beats
+            if isinstance(beat, dict)
         )
 
         valid = (
@@ -466,14 +680,19 @@ Return valid JSON only, in this exact general structure:
         if valid:
             for beat in beats:
                 clean_beat(beat)
+
             return data
 
-        print("Story did not pass checks. Trying again...")
+        print("Story failed validation. Regenerating...")
 
-    raise RuntimeError("AI could not create a valid episode")
+    raise RuntimeError(
+        "AI could not create a valid episode after four attempts."
+    )
 
 
-# ---------- voice generation ----------
+# ============================================================
+# VOICE GENERATION
+# ============================================================
 
 _KP = None
 
@@ -483,10 +702,13 @@ def init_tts():
 
     try:
         from kokoro import KPipeline
+
         _KP = KPipeline(lang_code="a")
         CFG["engine"] = "kokoro"
+
         print("Kokoro voice engine ready:", CFG["voice"])
         return
+
     except Exception as exc:
         print("Kokoro unavailable:", exc)
 
@@ -495,13 +717,21 @@ def init_tts():
     if os.getenv("GITHUB_ACTIONS"):
         try:
             subprocess.run(
-                ["sudo", "apt-get", "install", "-y", "-qq", "espeak-ng"],
+                [
+                    "sudo", "apt-get", "install",
+                    "-y", "-qq", "espeak-ng"
+                ],
                 check=False
             )
+
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", "piper-tts"],
+                [
+                    sys.executable, "-m", "pip",
+                    "install", "-q", "piper-tts"
+                ],
                 check=False
             )
+
         except Exception as exc:
             print("Piper setup issue:", exc)
 
@@ -523,16 +753,19 @@ def tts(text, wav):
             elif hasattr(audio, "numpy"):
                 audio = audio.numpy()
 
-            chunks.append(np.asarray(audio, dtype=np.float32))
+            chunks.append(
+                np.asarray(audio, dtype=np.float32)
+            )
 
         if not chunks:
-            raise RuntimeError("Kokoro returned no audio")
+            raise RuntimeError("Kokoro returned no audio.")
 
         sf.write(
             str(wav),
             np.concatenate(chunks),
             24000
         )
+
     else:
         run(
             [
@@ -555,7 +788,6 @@ def voice_beats(beats, folder):
 
         tts(beat["text"], raw)
 
-        # Cleaner voice, controlled loudness, and a small amount of silence.
         run([
             "ffmpeg", "-y",
             "-i", str(raw),
@@ -573,12 +805,17 @@ def voice_beats(beats, folder):
         ])
 
         raw.unlink(missing_ok=True)
+
         durations.append(probe_duration(final))
         files.append(final)
 
     concat_file = folder / "voice_list.txt"
+
     concat_file.write_text(
-        "".join(f"file '{file.name}'\n" for file in files),
+        "".join(
+            f"file '{file.name}'\n"
+            for file in files
+        ),
         encoding="utf-8"
     )
 
@@ -593,7 +830,9 @@ def voice_beats(beats, folder):
     return durations
 
 
-# ---------- word captions ----------
+# ============================================================
+# WORD CAPTIONS
+# ============================================================
 
 def transcribe_words(wav):
     from faster_whisper import WhisperModel
@@ -649,9 +888,11 @@ def write_ass(words, beats, durations, episode, path):
     ).replace("@FONT", CFG["font"])
 
     total = sum(durations)
+
     events = [
         f"Dialogue: 0,{ass_time(0)},{ass_time(total)},Head,,0,0,0,,"
-        f"{{\\an8\\pos(540,150)}}{SERIES_NAME.upper()}  |  EP {episode}"
+        f"{{\\an8\\pos(540,150)}}"
+        f"{SERIES_NAME.upper()}  |  EP {episode}"
     ]
 
     elapsed = 0.0
@@ -691,7 +932,12 @@ def write_ass(words, beats, durations, episode, path):
             finish = end + 0.06
 
         finish = max(finish, start + 0.10)
-        clean = re.sub(r"[{}\\]", "", word).upper()
+
+        clean = re.sub(
+            r"[{}\\]",
+            "",
+            word
+        ).upper()
 
         events.append(
             f"Dialogue: 1,{ass_time(start)},{ass_time(finish)},"
@@ -705,64 +951,9 @@ def write_ass(words, beats, durations, episode, path):
     )
 
 
-# ---------- original cartoon renderer ----------
-
-from PIL import Image, ImageDraw, ImageFont
-
-TW, TH = 720, 1280
-FPS = 30
-INK = (22, 22, 34)
-
-ROSTER = {
-    "kevin": {
-        "skin": (255, 205, 160),
-        "shirt": (255, 135, 35),
-        "pants": (48, 57, 130),
-        "hair": (85, 48, 28)
-    },
-    "dave": {
-        "skin": (225, 170, 130),
-        "shirt": (55, 135, 225),
-        "pants": (55, 55, 70),
-        "hair": (25, 25, 30),
-        "glasses": True
-    },
-    "cop": {
-        "skin": (240, 190, 150),
-        "shirt": (35, 55, 120),
-        "pants": (25, 35, 80),
-        "hair": (40, 30, 20),
-        "hat": (25, 40, 100)
-    },
-    "boss": {
-        "skin": (210, 160, 120),
-        "shirt": (95, 95, 105),
-        "pants": (60, 60, 70),
-        "hair": (170, 170, 175),
-        "tie": (210, 40, 40)
-    },
-    "kid": {
-        "skin": (250, 215, 180),
-        "shirt": (170, 90, 220),
-        "pants": (40, 40, 60),
-        "hair": (240, 200, 70)
-    },
-    "pigeon": {}
-}
-
-SCENES = {
-    "classroom": ((238, 216, 150), (150, 105, 70)),
-    "bedroom": ((176, 198, 240), (120, 90, 70)),
-    "kitchen": ((252, 238, 200), (196, 200, 212)),
-    "office": ((186, 212, 200), (90, 100, 122)),
-    "lab": ((58, 70, 96), (36, 42, 60)),
-    "stage": ((88, 28, 112), (62, 20, 72)),
-    "street": ((110, 196, 255), (70, 70, 82)),
-    "city_night": ((18, 18, 60), (35, 35, 65)),
-    "park": ((130, 210, 255), (96, 196, 96)),
-    "space": ((4, 4, 24), (25, 10, 55))
-}
-
+# ============================================================
+# CARTOON BACKGROUNDS
+# ============================================================
 
 def lerp(a, b, t):
     return a + (b - a) * t
@@ -781,15 +972,24 @@ def ease(value):
 
 
 def make_bg(scene):
-    top, bottom = SCENES.get(scene, SCENES["street"])
+    top, bottom = SCENES.get(
+        scene,
+        SCENES["street"]
+    )
+
     img = Image.new("RGB", (TW, TH))
     draw = ImageDraw.Draw(img)
 
     for y in range(TH):
         color = mix(top, bottom, y / TH)
-        draw.line([(0, y), (TW, y)], fill=color)
+        draw.line(
+            [(0, y), (TW, y)],
+            fill=color
+        )
 
-    rnd = random.Random(sum(map(ord, scene)))
+    rnd = random.Random(
+        sum(map(ord, scene))
+    )
 
     if scene in (
         "classroom", "bedroom", "kitchen",
@@ -809,6 +1009,7 @@ def make_bg(scene):
                 outline=(130, 85, 40),
                 width=14
             )
+
             draw.text(
                 (360, 320),
                 "???",
@@ -823,6 +1024,7 @@ def make_bg(scene):
                 outline=INK,
                 width=5
             )
+
             draw.rectangle(
                 [470, 150, 690, 420],
                 fill=(150, 212, 255),
@@ -837,6 +1039,7 @@ def make_bg(scene):
                 outline=INK,
                 width=4
             )
+
             draw.rectangle(
                 [0, 780, TW, 870],
                 fill=(140, 100, 70),
@@ -851,6 +1054,7 @@ def make_bg(scene):
                 outline=INK,
                 width=5
             )
+
             draw.rectangle(
                 [250, 640, 470, 790],
                 fill=(50, 55, 70),
@@ -865,6 +1069,7 @@ def make_bg(scene):
                 outline=INK,
                 width=5
             )
+
             for x, color in (
                 (120, (90, 255, 140)),
                 (330, (255, 90, 200)),
@@ -882,8 +1087,14 @@ def make_bg(scene):
                 [(0, 0), (180, 0), (80, 870), (0, 870)],
                 fill=(190, 30, 50)
             )
+
             draw.polygon(
-                [(TW, 0), (TW - 180, 0), (TW - 80, 870), (TW, 870)],
+                [
+                    (TW, 0),
+                    (TW - 180, 0),
+                    (TW - 80, 870),
+                    (TW, 870)
+                ],
                 fill=(190, 30, 50)
             )
 
@@ -922,6 +1133,7 @@ def make_bg(scene):
                         if night and rnd.random() < 0.5
                         else (190, 230, 255)
                     )
+
                     draw.rectangle(
                         [wx, wy, wx + 20, wy + 30],
                         fill=window
@@ -947,20 +1159,31 @@ def make_bg(scene):
             outline=INK,
             width=4
         )
+
         draw.ellipse(
             [260, 600, 940, 1000],
             fill=(90, 184, 100),
             outline=INK,
             width=4
         )
-        for x, height in ((90, 230), (590, 280), (430, 190)):
+
+        for x, height in (
+            (90, 230),
+            (590, 280),
+            (430, 190)
+        ):
             draw.rectangle(
                 [x - 18, 860 - height, x + 18, 870],
                 fill=(120, 80, 50)
             )
+
             draw.ellipse(
-                [x - 90, 860 - height - 130,
-                 x + 90, 860 - height + 50],
+                [
+                    x - 90,
+                    860 - height - 130,
+                    x + 90,
+                    860 - height + 50
+                ],
                 fill=(60, 160, 70),
                 outline=INK,
                 width=4
@@ -971,9 +1194,14 @@ def make_bg(scene):
             x = rnd.randint(0, TW)
             y = rnd.randint(0, TH)
             radius = rnd.choice((1, 2, 3))
+
             draw.ellipse(
-                [x - radius, y - radius,
-                 x + radius, y + radius],
+                [
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius
+                ],
                 fill=(255, 255, 255)
             )
 
@@ -986,6 +1214,10 @@ def make_bg(scene):
 
     return img
 
+
+# ============================================================
+# CHARACTERS
+# ============================================================
 
 def rotate_points(pivot, points, angle):
     cosine = math.cos(angle)
@@ -1007,63 +1239,96 @@ def draw_pigeon(draw, cx, base, unit, t, action):
         cx += math.sin(t * 35) * 8 * unit
 
     draw.line(
-        [(cx - 12 * unit, base - 30 * unit + bob),
-         (cx - 12 * unit, base)],
+        [
+            (cx - 12 * unit, base - 30 * unit + bob),
+            (cx - 12 * unit, base)
+        ],
         fill=(255, 150, 40),
         width=max(2, int(6 * unit))
     )
 
     draw.line(
-        [(cx + 16 * unit, base - 30 * unit + bob),
-         (cx + 16 * unit, base)],
+        [
+            (cx + 16 * unit, base - 30 * unit + bob),
+            (cx + 16 * unit, base)
+        ],
         fill=(255, 150, 40),
         width=max(2, int(6 * unit))
     )
 
     draw.ellipse(
-        [cx - 72 * unit, base - 118 * unit + bob,
-         cx + 72 * unit, base - 22 * unit + bob],
+        [
+            cx - 72 * unit,
+            base - 118 * unit + bob,
+            cx + 72 * unit,
+            base - 22 * unit + bob
+        ],
         fill=(162, 162, 178),
         outline=INK,
         width=4
     )
 
     draw.ellipse(
-        [cx + 30 * unit, base - 156 * unit + bob,
-         cx + 94 * unit, base - 92 * unit + bob],
+        [
+            cx + 30 * unit,
+            base - 156 * unit + bob,
+            cx + 94 * unit,
+            base - 92 * unit + bob
+        ],
         fill=(142, 142, 162),
         outline=INK,
         width=4
     )
 
     draw.polygon(
-        [(cx + 82 * unit, base - 136 * unit + bob),
-         (cx + 120 * unit, base - 124 * unit + bob),
-         (cx + 82 * unit, base - 114 * unit + bob)],
+        [
+            (cx + 82 * unit, base - 136 * unit + bob),
+            (cx + 120 * unit, base - 124 * unit + bob),
+            (cx + 82 * unit, base - 114 * unit + bob)
+        ],
         fill=(255, 172, 40),
         outline=INK
     )
 
     draw.ellipse(
-        [cx + 65 * unit, base - 145 * unit + bob,
-         cx + 83 * unit, base - 127 * unit + bob],
+        [
+            cx + 65 * unit,
+            base - 145 * unit + bob,
+            cx + 83 * unit,
+            base - 127 * unit + bob
+        ],
         fill=(255, 255, 255),
         outline=INK
     )
 
     draw.ellipse(
-        [cx + 72 * unit, base - 139 * unit + bob,
-         cx + 79 * unit, base - 132 * unit + bob],
+        [
+            cx + 72 * unit,
+            base - 139 * unit + bob,
+            cx + 79 * unit,
+            base - 132 * unit + bob
+        ],
         fill=INK
     )
 
 
-def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
+def draw_character(
+    draw, who, cx, base, unit,
+    emotion, action, t, beat_t
+):
     if who == "pigeon":
-        draw_pigeon(draw, cx, base, unit * 0.9, t, action)
+        draw_pigeon(
+            draw,
+            cx,
+            base,
+            unit * 0.9,
+            t,
+            action
+        )
         return
 
     spec = ROSTER.get(who, ROSTER["kevin"])
+
     dx = 0
     dy = 0
 
@@ -1089,8 +1354,12 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
     head_size = 112 * unit
 
     draw.ellipse(
-        [x - 72 * unit, base - 10 * unit,
-         x + 72 * unit, base + 16 * unit],
+        [
+            x - 72 * unit,
+            base - 10 * unit,
+            x + 72 * unit,
+            base + 16 * unit
+        ],
         fill=(35, 35, 45)
     )
 
@@ -1098,16 +1367,24 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
         leg_x = x + side * 24 * unit
 
         draw.rectangle(
-            [leg_x - 19 * unit, y - leg_height,
-             leg_x + 19 * unit, y - 8 * unit],
+            [
+                leg_x - 19 * unit,
+                y - leg_height,
+                leg_x + 19 * unit,
+                y - 8 * unit
+            ],
             fill=spec["pants"],
             outline=INK,
             width=4
         )
 
         draw.rounded_rectangle(
-            [leg_x - 24 * unit, y - 14 * unit,
-             leg_x + 24 * unit, y + 2 * unit],
+            [
+                leg_x - 24 * unit,
+                y - 14 * unit,
+                leg_x + 24 * unit,
+                y + 2 * unit
+            ],
             radius=max(3, int(6 * unit)),
             fill=(245, 245, 245),
             outline=INK,
@@ -1117,8 +1394,12 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
     top = y - leg_height - torso_height
 
     draw.rounded_rectangle(
-        [x - torso_width / 2, top,
-         x + torso_width / 2, y - leg_height + 6 * unit],
+        [
+            x - torso_width / 2,
+            top,
+            x + torso_width / 2,
+            y - leg_height + 6 * unit
+        ],
         radius=max(5, int(14 * unit)),
         fill=spec["shirt"],
         outline=INK,
@@ -1162,8 +1443,12 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
     head_top = top - head_size
 
     draw.rounded_rectangle(
-        [x - head_size / 2, head_top,
-         x + head_size / 2, head_top + head_size],
+        [
+            x - head_size / 2,
+            head_top,
+            x + head_size / 2,
+            head_top + head_size
+        ],
         radius=max(5, int(22 * unit)),
         fill=spec["skin"],
         outline=INK,
@@ -1171,8 +1456,12 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
     )
 
     draw.rounded_rectangle(
-        [x - head_size / 2, head_top,
-         x + head_size / 2, head_top + 34 * unit],
+        [
+            x - head_size / 2,
+            head_top,
+            x + head_size / 2,
+            head_top + 34 * unit
+        ],
         radius=max(5, int(18 * unit)),
         fill=spec["hair"],
         outline=INK,
@@ -1181,26 +1470,33 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
 
     if spec.get("hat"):
         draw.rectangle(
-            [x - head_size / 2 - 8 * unit,
-             head_top - 16 * unit,
-             x + head_size / 2 + 8 * unit,
-             head_top + 24 * unit],
+            [
+                x - head_size / 2 - 8 * unit,
+                head_top - 16 * unit,
+                x + head_size / 2 + 8 * unit,
+                head_top + 24 * unit
+            ],
             fill=spec["hat"],
             outline=INK,
             width=4
         )
 
     face_y = head_top + head_size * 0.56
-    eye_radius = (17 if emotion in ("shock", "scared") else 13) * unit
+
+    eye_radius = (
+        17 if emotion in ("shock", "scared") else 13
+    ) * unit
 
     for side in (-1, 1):
         eye_x = x + side * 24 * unit
 
         draw.ellipse(
-            [eye_x - eye_radius,
-             face_y - 8 * unit - eye_radius,
-             eye_x + eye_radius,
-             face_y - 8 * unit + eye_radius],
+            [
+                eye_x - eye_radius,
+                face_y - 8 * unit - eye_radius,
+                eye_x + eye_radius,
+                face_y - 8 * unit + eye_radius
+            ],
             fill=(255, 255, 255),
             outline=INK,
             width=3
@@ -1209,19 +1505,23 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
         pupil = eye_radius * 0.4
 
         draw.ellipse(
-            [eye_x - pupil,
-             face_y - 8 * unit - pupil,
-             eye_x + pupil,
-             face_y - 8 * unit + pupil],
+            [
+                eye_x - pupil,
+                face_y - 8 * unit - pupil,
+                eye_x + pupil,
+                face_y - 8 * unit + pupil
+            ],
             fill=INK
         )
 
         if spec.get("glasses"):
             draw.ellipse(
-                [eye_x - eye_radius - 5 * unit,
-                 face_y - 8 * unit - eye_radius - 5 * unit,
-                 eye_x + eye_radius + 5 * unit,
-                 face_y - 8 * unit + eye_radius + 5 * unit],
+                [
+                    eye_x - eye_radius - 5 * unit,
+                    face_y - 8 * unit - eye_radius - 5 * unit,
+                    eye_x + eye_radius + 5 * unit,
+                    face_y - 8 * unit + eye_radius + 5 * unit
+                ],
                 outline=INK,
                 width=3
             )
@@ -1230,38 +1530,57 @@ def draw_character(draw, who, cx, base, unit, emotion, action, t, beat_t):
 
     if emotion == "happy":
         draw.arc(
-            [x - 24 * unit, mouth_y - 24 * unit,
-             x + 24 * unit, mouth_y + 14 * unit],
+            [
+                x - 24 * unit,
+                mouth_y - 24 * unit,
+                x + 24 * unit,
+                mouth_y + 14 * unit
+            ],
             15, 165,
             fill=INK,
             width=5
         )
+
     elif emotion in ("shock", "scared"):
         draw.ellipse(
-            [x - 14 * unit, mouth_y - 5 * unit,
-             x + 14 * unit, mouth_y + 28 * unit],
+            [
+                x - 14 * unit,
+                mouth_y - 5 * unit,
+                x + 14 * unit,
+                mouth_y + 28 * unit
+            ],
             fill=(70, 12, 24),
             outline=INK,
             width=3
         )
+
     elif emotion == "angry":
         draw.arc(
-            [x - 20 * unit, mouth_y - 2 * unit,
-             x + 20 * unit, mouth_y + 30 * unit],
+            [
+                x - 20 * unit,
+                mouth_y - 2 * unit,
+                x + 20 * unit,
+                mouth_y + 30 * unit
+            ],
             200, 340,
             fill=INK,
             width=5
         )
+
     else:
         draw.line(
-            [(x - 14 * unit, mouth_y),
-             (x + 14 * unit, mouth_y)],
+            [
+                (x - 14 * unit, mouth_y),
+                (x + 14 * unit, mouth_y)
+            ],
             fill=INK,
             width=5
         )
 
 
-# ---------- objects and story actions ----------
+# ============================================================
+# OBJECTS AND STORY ACTIONS
+# ============================================================
 
 def object_position(position):
     return {
@@ -1273,6 +1592,7 @@ def object_position(position):
 
 def draw_object(draw, obj, beat_t, index):
     kind = obj["type"]
+
     if kind == "none":
         return
 
@@ -1283,17 +1603,24 @@ def draw_object(draw, obj, beat_t, index):
     action = obj["action"]
 
     if action == "bounce":
-        y -= abs(math.sin(beat_t * 7 + index)) * 100
-    elif action == "fall":
+        y -= abs(
+            math.sin(beat_t * 7 + index)
+        ) * 100
+
+    elif action in ("fall", "drop"):
         y = 220 + ease(beat_t / 0.7) * 460
+
     elif action == "grow":
         unit *= 0.6 + ease(beat_t / 0.8) * 0.8
+
     elif action == "fly":
         x += math.sin(beat_t * 3 + index) * 120
         y -= ease(beat_t / 0.7) * 280
+
     elif action == "spin":
         x += math.sin(beat_t * 5) * 40
         y += math.cos(beat_t * 5) * 30
+
     elif action == "shake":
         x += math.sin(beat_t * 35) * 18
 
@@ -1302,19 +1629,29 @@ def draw_object(draw, obj, beat_t, index):
 
     if kind == "phone":
         draw.rounded_rectangle(
-            [x - w * .45, y - h, x + w * .45, y + h],
+            [
+                x - w * 0.45, y - h,
+                x + w * 0.45, y + h
+            ],
             radius=20,
             fill=(35, 40, 55),
             outline=INK,
             width=6
         )
+
         draw.rectangle(
-            [x - w * .34, y - h * .78,
-             x + w * .34, y + h * .65],
+            [
+                x - w * 0.34, y - h * 0.78,
+                x + w * 0.34, y + h * 0.65
+            ],
             fill=(80, 190, 240)
         )
+
         draw.ellipse(
-            [x - 7, y + h * .76, x + 7, y + h * .9],
+            [
+                x - 7, y + h * 0.76,
+                x + 7, y + h * 0.9
+            ],
             fill=(220, 220, 220)
         )
 
@@ -1324,16 +1661,22 @@ def draw_object(draw, obj, beat_t, index):
             if kind == "box"
             else (180, 55, 90)
         )
+
         draw.rectangle(
-            [x - w, y - h * .6,
-             x + w, y + h * .6],
+            [
+                x - w, y - h * 0.6,
+                x + w, y + h * 0.6
+            ],
             fill=color,
             outline=INK,
             width=6
         )
+
         draw.rectangle(
-            [x - w * .12, y - h * .6,
-             x + w * .12, y + h * .6],
+            [
+                x - w * 0.12, y - h * 0.6,
+                x + w * 0.12, y + h * 0.6
+            ],
             fill=(255, 215, 70),
             outline=INK,
             width=3
@@ -1341,39 +1684,57 @@ def draw_object(draw, obj, beat_t, index):
 
     elif kind in ("rocket", "machine"):
         draw.rounded_rectangle(
-            [x - w * .42, y - h * 1.5,
-             x + w * .42, y + h * .8],
+            [
+                x - w * 0.42, y - h * 1.5,
+                x + w * 0.42, y + h * 0.8
+            ],
             radius=35,
             fill=(205, 210, 220),
             outline=INK,
             width=6
         )
+
         draw.polygon(
-            [(x - w * .42, y - h * .9),
-             (x - w, y + h * .4),
-             (x - w * .42, y + h * .2)],
+            [
+                (x - w * 0.42, y - h * 0.9),
+                (x - w, y + h * 0.4),
+                (x - w * 0.42, y + h * 0.2)
+            ],
             fill=(230, 55, 55),
             outline=INK
         )
+
         draw.polygon(
-            [(x + w * .42, y - h * .9),
-             (x + w, y + h * .4),
-             (x + w * .42, y + h * .2)],
+            [
+                (x + w * 0.42, y - h * 0.9),
+                (x + w, y + h * 0.4),
+                (x + w * 0.42, y + h * 0.2)
+            ],
             fill=(230, 55, 55),
             outline=INK
         )
+
         draw.ellipse(
-            [x - w * .22, y - h * .8,
-             x + w * .22, y - h * .35],
+            [
+                x - w * 0.22, y - h * 0.8,
+                x + w * 0.22, y - h * 0.35
+            ],
             fill=(70, 180, 240),
             outline=INK,
             width=4
         )
+
         if action in ("fly", "explode"):
             draw.polygon(
-                [(x - w * .25, y + h * .7),
-                 (x, y + h * 1.8 + abs(math.sin(beat_t * 15)) * 60),
-                 (x + w * .25, y + h * .7)],
+                [
+                    (x - w * 0.25, y + h * 0.7),
+                    (
+                        x,
+                        y + h * 1.8
+                        + abs(math.sin(beat_t * 15)) * 60
+                    ),
+                    (x + w * 0.25, y + h * 0.7)
+                ],
                 fill=(255, 120, 20)
             )
 
@@ -1383,24 +1744,39 @@ def draw_object(draw, obj, beat_t, index):
             "pizza": (235, 180, 75),
             "cake": (245, 180, 195)
         }[kind]
+
         draw.ellipse(
-            [x - w, y - h * .45,
-             x + w, y + h * .45],
+            [
+                x - w, y - h * 0.45,
+                x + w, y + h * 0.45
+            ],
             fill=color,
             outline=INK,
             width=6
         )
+
         if kind == "pizza":
-            for dx, dy in ((-30, -10), (30, 5), (0, 15)):
+            for dx, dy in (
+                (-30, -10),
+                (30, 5),
+                (0, 15)
+            ):
                 draw.ellipse(
-                    [x + dx - 10, y + dy - 10,
-                     x + dx + 10, y + dy + 10],
+                    [
+                        x + dx - 10,
+                        y + dy - 10,
+                        x + dx + 10,
+                        y + dy + 10
+                    ],
                     fill=(190, 50, 45)
                 )
+
         elif kind == "cake":
             draw.rectangle(
-                [x - w * .8, y - 5,
-                 x + w * .8, y + h * .4],
+                [
+                    x - w * 0.8, y - 5,
+                    x + w * 0.8, y + h * 0.4
+                ],
                 fill=(245, 220, 220),
                 outline=INK,
                 width=4
@@ -1412,12 +1788,17 @@ def draw_object(draw, obj, beat_t, index):
             if kind == "money"
             else (255, 205, 40)
         )
+
         draw.ellipse(
-            [x - w, y - h, x + w, y + h],
+            [
+                x - w, y - h,
+                x + w, y + h
+            ],
             fill=color,
             outline=INK,
             width=6
         )
+
         draw.text(
             (x, y),
             "$" if kind == "money" else "★",
@@ -1429,35 +1810,53 @@ def draw_object(draw, obj, beat_t, index):
 
     elif kind in ("car", "chair"):
         draw.rounded_rectangle(
-            [x - w * 1.3, y - h * .6,
-             x + w * 1.3, y + h * .35],
+            [
+                x - w * 1.3, y - h * 0.6,
+                x + w * 1.3, y + h * 0.35
+            ],
             radius=25,
             fill=(210, 45, 55),
             outline=INK,
             width=6
         )
+
         draw.ellipse(
-            [x - w, y + h * .1, x - w * .45, y + h * .7],
+            [
+                x - w, y + h * 0.1,
+                x - w * 0.45, y + h * 0.7
+            ],
             fill=(35, 35, 45),
             outline=INK,
             width=4
         )
+
         draw.ellipse(
-            [x + w * .45, y + h * .1,
-             x + w, y + h * .7],
+            [
+                x + w * 0.45, y + h * 0.1,
+                x + w, y + h * 0.7
+            ],
             fill=(35, 35, 45),
             outline=INK,
             width=4
         )
 
     elif kind in ("button", "ball"):
-        color = (230, 45, 50) if kind == "button" else (60, 140, 235)
+        color = (
+            (230, 45, 50)
+            if kind == "button"
+            else (60, 140, 235)
+        )
+
         draw.ellipse(
-            [x - w, y - w, x + w, y + w],
+            [
+                x - w, y - w,
+                x + w, y + w
+            ],
             fill=color,
             outline=INK,
             width=7
         )
+
         if kind == "button":
             draw.text(
                 (x, y),
@@ -1468,19 +1867,28 @@ def draw_object(draw, obj, beat_t, index):
 
     elif kind in ("computer", "tv"):
         draw.rectangle(
-            [x - w, y - h, x + w, y + h * .65],
+            [
+                x - w, y - h,
+                x + w, y + h * 0.65
+            ],
             fill=(35, 40, 55),
             outline=INK,
             width=7
         )
+
         draw.rectangle(
-            [x - w * .8, y - h * .8,
-             x + w * .8, y + h * .4],
+            [
+                x - w * 0.8, y - h * 0.8,
+                x + w * 0.8, y + h * 0.4
+            ],
             fill=(80, 185, 235)
         )
+
         draw.rectangle(
-            [x - 10, y + h * .65,
-             x + 10, y + h],
+            [
+                x - 10, y + h * 0.65,
+                x + 10, y + h
+            ],
             fill=(70, 70, 80)
         )
 
@@ -1490,46 +1898,64 @@ def draw_object(draw, obj, beat_t, index):
             if kind == "trophy"
             else (105, 110, 220)
         )
+
         draw.ellipse(
-            [x - w, y - h, x + w, y + h],
+            [
+                x - w, y - h,
+                x + w, y + h
+            ],
             fill=color,
             outline=INK,
             width=6
         )
+
         if kind == "trophy":
             draw.rectangle(
-                [x - w * .2, y + h * .6,
-                 x + w * .2, y + h * 1.1],
-                fill=color,
-                outline=INK,
-                width=4
-            )
-            draw.rectangle(
-                [x - w * .6, y + h * 1.05,
-                 x + w * .6, y + h * 1.3],
+                [
+                    x - w * 0.2, y + h * 0.6,
+                    x + w * 0.2, y + h * 1.1
+                ],
                 fill=color,
                 outline=INK,
                 width=4
             )
 
-    elif kind in ("table",):
+            draw.rectangle(
+                [
+                    x - w * 0.6, y + h * 1.05,
+                    x + w * 0.6, y + h * 1.3
+                ],
+                fill=color,
+                outline=INK,
+                width=4
+            )
+
+    elif kind == "table":
         draw.rectangle(
-            [x - w * 1.3, y - h * .2,
-             x + w * 1.3, y + h * .1],
+            [
+                x - w * 1.3, y - h * 0.2,
+                x + w * 1.3, y + h * 0.1
+            ],
             fill=(150, 95, 55),
             outline=INK,
             width=5
         )
+
         draw.rectangle(
-            [x - w, y + h * .1,
-             x - w * .8, y + h],
+            [
+                x - w, y + h * 0.1,
+                x - w * 0.8, y + h
+            ],
             fill=(150, 95, 55),
             outline=INK,
             width=4
         )
+
         draw.rectangle(
-            [x + w * .8, y + h * .1,
-             x + w, y + h],
+            [
+                x + w * 0.8, y + h * 0.1,
+                x + w, y + h
+            ],
             fill=(150, 95, 55),
             outline=INK,
             width=4
@@ -1537,26 +1963,37 @@ def draw_object(draw, obj, beat_t, index):
 
     elif kind == "sign":
         draw.rectangle(
-            [x - w, y - h, x + w, y + h * .5],
+            [
+                x - w, y - h,
+                x + w, y + h * 0.5
+            ],
             fill=(255, 220, 65),
             outline=INK,
             width=6
         )
+
         draw.text(
-            (x, y - h * .2),
+            (x, y - h * 0.2),
             "WARNING",
             fill=INK,
             anchor="mm"
         )
 
 
+# ============================================================
+# EFFECTS AND VISUAL DESCRIPTIONS
+# ============================================================
+
 def draw_effect(draw, effect, beat_t, frame):
     cx = TW / 2
     cy = 500
 
     if effect == "explosion":
-        radius = 40 + ease(beat_t / 0.35) * 280
-        radius += math.sin(beat_t * 25) * 10
+        radius = (
+            40
+            + ease(beat_t / 0.35) * 280
+            + math.sin(beat_t * 25) * 10
+        )
 
         for scale, color in (
             (1.0, (220, 40, 40)),
@@ -1565,21 +2002,28 @@ def draw_effect(draw, effect, beat_t, frame):
             (0.27, (255, 255, 220))
         ):
             points = []
+
             for i in range(24):
                 r = radius * scale * (
                     1 if i % 2 == 0 else 0.55
                 )
+
                 angle = i / 24 * math.tau
+
                 points.append((
                     cx + math.cos(angle) * r,
                     cy + math.sin(angle) * r
                 ))
+
             draw.polygon(points, fill=color)
 
     elif effect == "fire":
         for i in range(7):
             x = 40 + i * 100
-            height = 170 + 70 * math.sin(beat_t * 10 + i)
+            height = 170 + 70 * math.sin(
+                beat_t * 10 + i
+            )
+
             draw.polygon(
                 [
                     (x - 45, 1000),
@@ -1588,10 +2032,11 @@ def draw_effect(draw, effect, beat_t, frame):
                 ],
                 fill=(255, 100, 15)
             )
+
             draw.polygon(
                 [
                     (x - 20, 1000),
-                    (x, 1000 - height * .6),
+                    (x, 1000 - height * 0.6),
                     (x + 20, 1000)
                 ],
                 fill=(255, 220, 65)
@@ -1606,31 +2051,44 @@ def draw_effect(draw, effect, beat_t, frame):
 
     elif effect == "sparkle":
         rnd = random.Random(7)
+
         for i in range(10):
             x = rnd.randint(40, TW - 40)
             y = rnd.randint(150, 900)
+
             radius = 12 + 12 * abs(
                 math.sin(beat_t * 7 + i)
             )
+
             draw.line(
-                [(x - radius, y), (x + radius, y)],
+                [
+                    (x - radius, y),
+                    (x + radius, y)
+                ],
                 fill=(255, 245, 140),
                 width=5
             )
+
             draw.line(
-                [(x, y - radius), (x, y + radius)],
+                [
+                    (x, y - radius),
+                    (x, y + radius)
+                ],
                 fill=(255, 245, 140),
                 width=5
             )
 
 
 def draw_visual_description(draw, text, font):
-    """Display a short visual cue when the scene has no special object."""
     if not text:
         return
 
-    # Keep the cue small so it does not compete with the spoken captions.
-    clean = re.sub(r"[^A-Za-z0-9 !?'$-]", "", text).strip()
+    clean = re.sub(
+        r"[^A-Za-z0-9 !?'$-]",
+        "",
+        text
+    ).strip()
+
     if not clean:
         return
 
@@ -1654,15 +2112,24 @@ def draw_visual_description(draw, text, font):
     )
 
 
+# ============================================================
+# CARTOON VIDEO RENDERER
+# ============================================================
+
 def toon_background(beats, durations, folder):
-    """Render the story as animated cartoon footage."""
     bgs = {}
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+    font_path = (
+        "/usr/share/fonts/truetype/dejavu/"
+        "DejaVuSans-Bold.ttf"
+    )
 
     if Path(font_path).exists():
         font = ImageFont.truetype(font_path, 22)
     else:
         font = ImageFont.load_default()
+
+    output_path = folder / "bg.mp4"
 
     command = [
         "ffmpeg", "-y",
@@ -1676,7 +2143,7 @@ def toon_background(beats, durations, folder):
         "-preset", "veryfast",
         "-crf", "19",
         "-pix_fmt", "yuv420p",
-        str(folder / "bg.mp4")
+        str(output_path)
     ]
 
     process = subprocess.Popen(
@@ -1688,7 +2155,9 @@ def toon_background(beats, durations, folder):
     frame_number = 0
 
     try:
-        for index, (beat, duration) in enumerate(zip(beats, durations)):
+        for index, (beat, duration) in enumerate(
+            zip(beats, durations)
+        ):
             scene = beat["scene"]
 
             if scene not in bgs:
@@ -1710,7 +2179,11 @@ def toon_background(beats, durations, folder):
             }
 
             start_frame = frame_number
-            end_frame = start_frame + round(duration * FPS)
+
+            end_frame = (
+                start_frame
+                + round(duration * FPS)
+            )
 
             for frame in range(start_frame, end_frame):
                 beat_t = (frame - start_frame) / FPS
@@ -1719,7 +2192,6 @@ def toon_background(beats, durations, folder):
                 img = bgs[scene].copy()
                 draw = ImageDraw.Draw(img)
 
-                # Background effects appear behind the characters.
                 draw_effect(
                     draw,
                     beat["fx"],
@@ -1727,8 +2199,9 @@ def toon_background(beats, durations, folder):
                     frame
                 )
 
-                # Draw actual story objects.
-                for obj_index, obj in enumerate(beat["objects"]):
+                for obj_index, obj in enumerate(
+                    beat["objects"]
+                ):
                     draw_object(
                         draw,
                         obj,
@@ -1736,7 +2209,6 @@ def toon_background(beats, durations, folder):
                         obj_index
                     )
 
-                # Characters react to the story.
                 for char, position in zip(
                     characters,
                     positions[count]
@@ -1753,7 +2225,6 @@ def toon_background(beats, durations, folder):
                         beat_t
                     )
 
-                # Foreground effects.
                 if beat["fx"] == "sparkle":
                     draw_effect(
                         draw,
@@ -1762,7 +2233,6 @@ def toon_background(beats, durations, folder):
                         frame
                     )
 
-                # Short opening visual cue.
                 if beat_t < 1.2 and beat.get("visual"):
                     draw_visual_description(
                         draw,
@@ -1770,7 +2240,6 @@ def toon_background(beats, durations, folder):
                         font
                     )
 
-                # Episode progress bar.
                 progress = (
                     index + beat_t / max(duration, 0.1)
                 ) / len(beats)
@@ -1783,11 +2252,16 @@ def toon_background(beats, durations, folder):
                     width=2
                 )
 
+                progress_right = clamp(
+                    99 + max(5, int(522 * progress)),
+                    104,
+                    621
+                )
+
                 draw.rounded_rectangle(
                     [
                         99, 424,
-                        99 + max(5, int(522 * progress)),
-                        450
+                        progress_right, 450
                     ],
                     radius=12,
                     fill=mix(
@@ -1807,12 +2281,13 @@ def toon_background(beats, durations, folder):
                     stroke_fill=INK
                 )
 
-                # Camera punch-in at the start of each beat.
                 zoom = (
                     1.0
                     + 0.10 * (1 - ease(beat_t / 0.25))
                     + 0.025 * math.sin(beat_t * 2)
                 )
+
+                zoom = max(1.0, zoom)
 
                 shake = (
                     12 * max(0, 1 - beat_t / 0.5)
@@ -1823,90 +2298,81 @@ def toon_background(beats, durations, folder):
                 shake_x = math.sin(frame * 2.7) * shake
                 shake_y = math.cos(frame * 3.1) * shake
 
-                crop_w = TW / zoom
-                crop_h = TH / zoom
+                # Safe crop: never allow a crop box outside the image.
+                crop_w = max(1, min(TW, TW / zoom))
+                crop_h = max(1, min(TH, TH / zoom))
 
                 left = clamp(
                     TW / 2 + shake_x - crop_w / 2,
                     0,
                     TW - crop_w
                 )
+
                 top = clamp(
                     TH / 2 + shake_y - crop_h / 2,
                     0,
                     TH - crop_h
                 )
 
+                right = min(
+                    TW,
+                    max(left + 1, left + crop_w)
+                )
+
+                bottom = min(
+                    TH,
+                    max(top + 1, top + crop_h)
+                )
+
+                img = img.crop((
+                    int(left),
+                    int(top),
+                    int(right),
+                    int(bottom)
+                ))
+
                 img = img.resize(
                     (TW, TH),
-                    Image.Resampling.BILINEAR,
-                    box=(
-                        left,
-                        top,
-                        left + crop_w,
-                        top + crop_h
-                    )
+                    Image.Resampling.BILINEAR
                 )
 
                 process.stdin.write(img.tobytes())
 
             frame_number = end_frame
 
-    finally:
+    except Exception:
         if process.stdin:
             process.stdin.close()
 
+        process.wait()
+        raise
+
+    finally:
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+
     if process.wait() != 0:
-        raise RuntimeError("Cartoon video rendering failed")
+        raise RuntimeError(
+            "Cartoon video rendering failed."
+        )
 
-    return folder / "bg.mp4", []
+    return output_path, []
 
 
-# ---------- optional stock footage ----------
-
-def pexels_candidates(query):
-    response = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers={
-            "Authorization": os.environ["PEXELS_API_KEY"]
-        },
-        params={
-            "query": query,
-            "orientation": "portrait",
-            "per_page": 15
-        },
-        timeout=30
-    )
-
-    response.raise_for_status()
-    results = []
-
-    for video in response.json().get("videos", []):
-        files = [
-            item for item in video.get("video_files", [])
-            if item.get("file_type") == "video/mp4"
-            and (item.get("width") or 0) >= 720
-            and (item.get("height") or 0) > (item.get("width") or 0)
-        ]
-
-        if files:
-            chosen = min(
-                files,
-                key=lambda item: abs(item["width"] - 1080)
-            )
-            results.append((
-                chosen["link"],
-                video.get("url")
-            ))
-
-    return results
-
+# ============================================================
+# OPTIONAL STOCK FOOTAGE
+# ============================================================
 
 def pixabay_candidates(query):
+    key = os.getenv("PIXABAY_API_KEY")
+
+    if not key:
+        return []
+
     response = requests.get(
         "https://pixabay.com/api/videos/",
         params={
-            "key": os.environ["PIXABAY_API_KEY"],
+            "key": key,
             "q": query[:100],
             "per_page": 20,
             "safesearch": "true",
@@ -1916,15 +2382,17 @@ def pixabay_candidates(query):
     )
 
     response.raise_for_status()
+
     results = []
 
     for hit in response.json().get("hits", []):
         videos = hit.get("videos", {})
+
         chosen = next(
             (
-                videos[key]
-                for key in ("medium", "small", "large")
-                if videos.get(key, {}).get("url")
+                videos[name]
+                for name in ("medium", "small", "large")
+                if videos.get(name, {}).get("url")
             ),
             None
         )
@@ -1954,6 +2422,7 @@ def download(url, path):
 
 def make_seg(raw, duration, output):
     raw_duration = probe_duration(raw)
+
     start = random.uniform(
         0,
         max(0.0, raw_duration - duration - 0.2)
@@ -1983,45 +2452,47 @@ def make_seg(raw, duration, output):
 
 
 def build_background(beats, durations, folder):
-    use_api = bool(
-        os.getenv("PIXABAY_API_KEY")
-        or os.getenv("PEXELS_API_KEY")
+    use_api = bool(os.getenv("PIXABAY_API_KEY"))
+
+    local = pick_files(
+        ROOT / "footage",
+        VIDEO_EXT
     )
 
-    search = (
-        pixabay_candidates
-        if os.getenv("PIXABAY_API_KEY")
-        else pexels_candidates
-    )
-
-    local = pick_files(ROOT / "footage", VIDEO_EXT)
     pool = []
     used = set()
     sources = []
     segments = []
 
-    for index, (beat, duration) in enumerate(zip(beats, durations)):
+    for index, (beat, duration) in enumerate(
+        zip(beats, durations)
+    ):
         raw = None
 
         if use_api:
             try:
                 candidates = [
-                    item for item in search(beat["visual"])
+                    item for item in pixabay_candidates(
+                        beat["visual"]
+                    )
                     if item[0] not in used
                 ]
 
                 if not candidates:
                     candidates = [
-                        item for item in search(
-                            beat["visual"].split()[0]
+                        item for item in pixabay_candidates(
+                            beat["scene"].replace("_", " ")
                         )
                         if item[0] not in used
                     ]
 
                 if candidates:
                     url, page = random.choice(candidates[:8])
+
                     raw = folder / f"raw_{index}.mp4"
+
                     download(url, raw)
+
                     used.add(url)
                     pool.append(raw)
                     sources.append(page)
@@ -2037,14 +2508,17 @@ def build_background(beats, durations, folder):
 
         if raw is None:
             raise RuntimeError(
-                f"No footage found for beat {index + 1}"
+                f"No footage found for beat {index + 1}."
             )
 
         segment = folder / f"segment_{index}.mp4"
+
         make_seg(raw, duration, segment)
+
         segments.append(segment)
 
     concat_file = folder / "segments.txt"
+
     concat_file.write_text(
         "".join(
             f"file '{segment.name}'\n"
@@ -2064,7 +2538,9 @@ def build_background(beats, durations, folder):
     return folder / "bg.mp4", sources
 
 
-# ---------- final video ----------
+# ============================================================
+# FINAL VIDEO
+# ============================================================
 
 def render(background, voice, workdir, output, duration):
     music_files = pick_files(
@@ -2072,7 +2548,11 @@ def render(background, voice, workdir, output, duration):
         AUDIO_EXT
     )
 
-    music = random.choice(music_files) if music_files else None
+    music = (
+        random.choice(music_files)
+        if music_files
+        else None
+    )
 
     command = [
         "ffmpeg", "-y",
@@ -2096,6 +2576,7 @@ def render(background, voice, workdir, output, duration):
             "[1:a][music]amix=inputs=2:duration=first:"
             "dropout_transition=0:normalize=0[a]"
         )
+
     else:
         audio_filter = "[1:a]anull[a]"
 
@@ -2116,13 +2597,17 @@ def render(background, voice, workdir, output, duration):
     ]
 
     run(command, cwd=workdir)
+
     return music.name if music else None
 
 
-# ---------- episode production ----------
+# ============================================================
+# EPISODE PRODUCTION
+# ============================================================
 
 def make_video(index):
     state = load_state()
+
     episode_number = len(state["episodes"]) + 1
 
     data = write_episode(
@@ -2151,12 +2636,19 @@ def make_video(index):
     )
 
     print("Generating narration...")
-    durations = voice_beats(beats, folder)
+
+    durations = voice_beats(
+        beats,
+        folder
+    )
 
     total_duration = sum(durations)
 
     print("Generating word captions...")
-    words = transcribe_words(folder / "voice.wav")
+
+    words = transcribe_words(
+        folder / "voice.wav"
+    )
 
     write_ass(
         words,
@@ -2167,12 +2659,14 @@ def make_video(index):
     )
 
     print("Animating scenes...")
+
     if CFG["visuals"] == "toon":
         background, sources = toon_background(
             beats,
             durations,
             folder
         )
+
     else:
         background, sources = build_background(
             beats,
@@ -2181,6 +2675,7 @@ def make_video(index):
         )
 
     print("Rendering final video...")
+
     music = render(
         background,
         folder / "voice.wav",
@@ -2189,7 +2684,6 @@ def make_video(index):
         total_duration
     )
 
-    # Remove temporary render files only.
     for pattern in (
         "voice_raw_*.wav",
         "voice_*.wav",
@@ -2241,7 +2735,9 @@ def make_video(index):
     return str(folder), data["title"]
 
 
-# ---------- notifications and checks ----------
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
 
 def notify(message):
     token = os.getenv("TELEGRAM_TOKEN")
@@ -2259,6 +2755,7 @@ def notify(message):
             },
             timeout=15
         )
+
     except Exception:
         pass
 
@@ -2272,7 +2769,7 @@ def notify_video(path, caption):
 
     try:
         with open(path, "rb") as video:
-            requests.post(
+            response = requests.post(
                 f"https://api.telegram.org/bot{token}/sendVideo",
                 data={
                     "chat_id": chat,
@@ -2283,9 +2780,16 @@ def notify_video(path, caption):
                 },
                 timeout=180
             )
+
+            response.raise_for_status()
+
     except Exception as exc:
         print("Telegram video notification failed:", exc)
 
+
+# ============================================================
+# PREFLIGHT CHECKS
+# ============================================================
 
 def preflight():
     errors = []
@@ -2293,7 +2797,7 @@ def preflight():
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             errors.append(
-                f"{tool} is missing from PATH"
+                f"{tool} is missing from PATH."
             )
 
     if CFG["engine"] == "piper":
@@ -2302,25 +2806,24 @@ def preflight():
             or Path(CFG["piper_bin"]).exists()
         ):
             errors.append(
-                "Kokoro failed and Piper is not installed"
+                "Piper is not installed or not found."
             )
+
         elif not Path(CFG["piper_model"]).exists():
             errors.append(
                 "Piper model is missing: "
                 + CFG["piper_model"]
             )
 
-    if (
-        CFG["visuals"] == "stock"
-        and not (
-            os.getenv("PIXABAY_API_KEY")
-            or os.getenv("PEXELS_API_KEY")
-        )
-        and not pick_files(ROOT / "footage", VIDEO_EXT)
-    ):
-        errors.append(
-            "Stock mode needs an API key or licensed footage folder"
-        )
+    if CFG["visuals"] == "stock":
+        if (
+            not os.getenv("PIXABAY_API_KEY")
+            and not pick_files(ROOT / "footage", VIDEO_EXT)
+        ):
+            errors.append(
+                "Stock mode needs a Pixabay API key "
+                "or licensed footage in the footage folder."
+            )
 
     if not os.getenv("GEMINI_API_KEY"):
         try:
@@ -2328,15 +2831,18 @@ def preflight():
                 CFG["ollama_url"].rsplit("/api", 1)[0],
                 timeout=5
             )
+
         except Exception:
             errors.append(
-                "No Gemini API key and Ollama is not running"
+                "No Gemini API key and Ollama is not running."
             )
 
     return errors
 
 
-# ---------- main ----------
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     OUT_DAY.mkdir(
@@ -2347,7 +2853,7 @@ def main():
     completed = []
     errors = []
 
-    print("Starting Shorts Factory v3...")
+    print("Starting Shorts Factory v4...")
     print("Visual engine:", CFG["visuals"])
 
     init_tts()
@@ -2422,6 +2928,7 @@ def main():
         output.write(report_text + "\n\n")
 
     print(report_text)
+
     notify(report_text)
 
 
