@@ -1,4 +1,3 @@
-
 name: Daily Shorts
 
 on:
@@ -11,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
 
     steps:
@@ -25,29 +24,40 @@ jobs:
       - name: Install system tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core espeak-ng curl xz-utils
-          blender_version="4.1.1"
-          curl -fL "https://download.blender.org/release/Blender4.1/blender-${blender_version}-linux-x64.tar.xz" -o /tmp/blender.tar.xz
-          tar -xJf /tmp/blender.tar.xz -C "$HOME"
-          echo "$HOME/blender-${blender_version}-linux-x64" >> "$GITHUB_PATH"
-          echo "Blender installed:"
-          "$HOME/blender-${blender_version}-linux-x64/blender" --version
+          sudo apt-get install -y -qq ffmpeg blender fonts-dejavu-core espeak-ng
+          blender --version
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install --upgrade Pillow soundfile faster-whisper requests
+          python -m pip install --upgrade Pillow soundfile faster-whisper requests huggingface_hub piper-tts
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install "kokoro>=0.9.4"
 
-      - name: Download Piper fallback voice
+      - name: Download Piper voice model
         run: |
           mkdir -p models
-          curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar xz
-          curl -fsSL -o models/en_US-lessac-medium.onnx "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-          curl -fsSL -o models/en_US-lessac-medium.onnx.json "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          from pathlib import Path
+          import shutil
+
+          files = [
+              "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+              "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+          ]
+          Path("models").mkdir(exist_ok=True)
+          for filename in files:
+              downloaded = hf_hub_download(
+                  repo_id="rhasspy/piper-voices",
+                  filename=filename,
+                  repo_type="model",
+              )
+              destination = Path("models") / Path(filename).name
+              shutil.copy2(downloaded, destination)
+              print(f"Downloaded {destination}")
+          PY
 
       - name: Make videos
         env:
@@ -58,11 +68,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NICHE: ${{ vars.NICHE }}
           VIDEOS_PER_RUN: ${{ vars.VIDEOS_PER_RUN }}
-          PIPER_BIN: ${{ github.workspace }}/piper/piper
+          PIPER_BIN: piper
           VISUALS: blender
-          VOICE: am_fenrir
-          VOICE_SPEED: "1.10"
-          REQUIRE_KOKORO: "1"
+          VOICE: en_US-lessac-medium
         run: python -u pipeline.py
 
       - name: Save topic history
