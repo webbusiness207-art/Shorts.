@@ -296,10 +296,10 @@ def gemini_generate(prompt):
                         print(f"Waiting {delay:.1f}s before one retry...")
                         time.sleep(delay)
                         continue
-                    raise RuntimeError(
-                        "Gemini keeps returning HTTP 429. Check your Google "
-                        "AI Studio quota and rate limits. " + last_error
-                    )
+                    # This model's quota is used up; other models have
+                    # their own quota, so move on to the next one.
+                    print("Quota exhausted for", model, "- trying next model.")
+                    break
 
                 if status in (500, 502, 503, 504):
                     last_error = gemini_error_detail(response)
@@ -528,6 +528,8 @@ Effects: {sorted(EFFECTS)}
         except Exception as exc:
             last_error = exc
             print(f"Story attempt {attempt + 1} failed:", exc)
+            if "429" in str(exc):
+                break  # quota is gone; more retries only waste requests
             time.sleep(1.5 * (attempt + 1))
 
     raise RuntimeError(f"Could not create a valid story: {last_error}")
@@ -1488,6 +1490,8 @@ def main():
                 message = f"Video {offset + 1}: {exc}"
                 errors.append(message)
                 print(message)
+                if "429" in str(exc):
+                    break  # out of Gemini quota; stop instead of burning more
                 with (OUT_DAY / "errors.log").open("a", encoding="utf-8") as log:
                     log.write(traceback.format_exc() + "\n")
     else:
