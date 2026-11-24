@@ -63,7 +63,7 @@ jobs:
           VOICE: am_fenrir
           VOICE_SPEED: "1.10"
           REQUIRE_KOKORO: "1"
-        run: python pipeline.py
+        run: python -u pipeline.py
 
       - name: Save topic history
         if: always()
