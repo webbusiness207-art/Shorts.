@@ -269,6 +269,221 @@ def gemini_generate(prompt):
     raise RuntimeError(f"Gemini failed: {last_error}")
 
 
+def discover_gemini_models(api_key):
+    """Find a small number of usable Gemini Flash models."""
+    try:
+        response = requests.get(
+            f"{GEMINI_BASE}/models",
+            params={"key": api_key},
+            timeout=15,
+        )
+        response.raise_for_status()
+
+        models = []
+
+        for item in response.json().get("models", []):
+            name = item.get("name", "")
+            methods = item.get("supportedGenerationMethods", [])
+            lowered = name.lower()
+
+            if (
+                "generateContent" in methods
+                and "flash" in lowered
+                and not any(x in lowered for x in (
+                    "image", "audio", "tts", "live", "embedding"
+                ))
+            ):
+                models.append(name.split("/")[-1])
+
+        # Prefer stable model names over preview/experimental ones.
+        models.sort(
+            key=lambda n: (
+                "preview" in n.lower() or "experimental" in n.lower(),
+                "latest" not in n.lower(),
+                n,
+            )
+        )
+
+        return models[:2]
+
+    except Exception as exc:
+        print("Gemini model discovery warning:", str(exc)[:500])
+        return []
+
+
+def gemini_error_detail(response):
+    """Extract Google's actual error message without exposing the API key."""
+    try:
+        payload = response.json()
+        error = payload.get("error", {})
+        message = error.get("message", "")
+        status = error.get("status", "")
+
+        detail = f"HTTP {response.status_code}"
+
+        if status:
+            detail += f" ({status})"
+
+        if message:
+            detail += f": {message}"
+        else:
+            detail += f": {response.text[:800]}"
+
+        return detail
+
+    except Exception:
+        return f"HTTP {response.status_code}: {response.text[:800]}"
+
+
+def gemini_generate(prompt):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    discovered = discover_gemini_models(api_key)
+
+    candidates = []
+
+    if CFG["gemini_model"]:
+        candidates.append(CFG["gemini_model"])
+
+    candidates.extend(discovered)
+    candidates.append("gemini-2.5-flash")
+
+    # Never spend minutes cycling through dozens of models.
+    candidates = list(dict.fromkeys(candidates))[:3]
+
+    if not candidates:
+        raise RuntimeError("No Gemini models were available to try.")
+
+    print("Gemini models to try:", ", ".join(candidates))
+
+    last_error = "No Gemini model succeeded."
+
+    for model in candidates:
+        print(f"Trying Gemini model: {model}")
+
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{GEMINI_BASE}/models/{model}:generateContent",
+                    params={"key": api_key},
+                    json={
+                        "contents": [
+                            {"parts": [{"text": prompt}]}
+                        ],
+                        "generationConfig": {
+                            "temperature": 0.9,
+                            "responseMimeType": "application/json",
+                        },
+                    },
+                    timeout=75,
+                )
+
+                status = response.status_code
+
+                if status == 429:
+                    last_error = gemini_error_detail(response)
+                    print("Gemini rate limit or quota response:")
+                    print(last_error)
+
+                    if attempt == 0:
+                        retry = response.headers.get("Retry-After")
+
+                        try:
+                            delay = clamp(float(retry), 2, 15)
+                        except (TypeError, ValueError):
+                            delay = 5
+
+                        print(
+                            f"Waiting {delay:.1f}s before one retry..."
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    # Repeated 429s usually won't be fixed by cycling
+                    # through more models on the same API project.
+                    raise RuntimeError(
+                        "Gemini is still returning HTTP 429. "
+                        "Check your Google AI Studio project quota "
+                        "and rate limits. Details: " + last_error
+                    )
+
+                if status in (500, 502, 503, 504):
+                    last_error = gemini_error_detail(response)
+                    print("Temporary Gemini server error:", last_error)
+
+                    if attempt < 2:
+                        delay = 2 ** attempt
+                        print(f"Retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
+
+                    break
+
+                if status == 404:
+                    last_error = gemini_error_detail(response)
+                    print("Model unavailable; trying another model.")
+                    break
+
+                if not response.ok:
+                    last_error = gemini_error_detail(response)
+                    raise RuntimeError(
+                        "Gemini rejected the request: " + last_error
+                    )
+
+                payload = response.json()
+
+                candidates_data = payload.get("candidates", [])
+
+                if not candidates_data:
+                    feedback = payload.get("promptFeedback", {})
+                    raise RuntimeError(
+                        "Gemini returned no candidates. "
+                        + json.dumps(feedback)[:800]
+                    )
+
+                parts = candidates_data[0].get(
+                    "content", {}
+                ).get("parts", [])
+
+                generated_text = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if part.get("text")
+                )
+
+                if not generated_text.strip():
+                    raise RuntimeError(
+                        "Gemini returned an empty response."
+                    )
+
+                result = extract_json(generated_text)
+
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "Gemini response was not a JSON object."
+                    )
+
+                print(f"Gemini successfully generated a response with {model}.")
+                return result
+
+            except requests.RequestException as exc:
+                last_error = f"{model}: network error: {exc}"
+                print(last_error)
+
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    break
+
+    raise RuntimeError(
+        "All available Gemini attempts failed. Last error: "
+        + last_error
+    )
+
+
 def ollama_generate(prompt):
     response = requests.post(
         CFG["ollama_url"],
@@ -287,34 +502,28 @@ def ollama_generate(prompt):
 def llm_json(prompt):
     try:
         return gemini_generate(prompt)
+
     except Exception as gemini_error:
-        print("Gemini unavailable; trying Ollama:", gemini_error)
-        try:
-            return ollama_generate(prompt)
-        except Exception as ollama_error:
-            raise RuntimeError(
-                f"Story generation failed. Gemini: {gemini_error}; "
-                f"Ollama: {ollama_error}"
-            )
+        # GitHub Actions does not have a local Ollama server by default.
+        # Only try Ollama if the user explicitly enables it.
+        if os.getenv("USE_OLLAMA_FALLBACK", "0") == "1":
+            print("Gemini failed; trying configured Ollama fallback.")
 
+            try:
+                return ollama_generate(prompt)
+            except Exception as ollama_error:
+                raise RuntimeError(
+                    f"Gemini failed: {gemini_error}; "
+                    f"Ollama failed: {ollama_error}"
+                )
 
-SCENES = {
-    "classroom", "bedroom", "kitchen", "office", "lab",
-    "stage", "street", "city_night", "park", "space",
-}
-EMOTIONS = {"neutral", "happy", "angry", "shock", "scared"}
-ACTIONS = {"idle", "jump", "shake", "slide", "panic", "point", "run"}
-OBJECTS = {
-    "none", "phone", "box", "rocket", "car", "button", "pancake",
-    "cake", "money", "computer", "machine", "trophy", "chair",
-    "table", "sign", "ball", "planet", "giant_coin", "pizza",
-    "suitcase", "tv", "present",
-}
-OBJECT_ACTIONS = {
-    "idle", "bounce", "spin", "fall", "grow", "shake",
-    "fly", "explode", "slide", "drop",
-}
-EFFECTS = {"none", "explosion", "fire", "sparkle", "shock"}
+        raise RuntimeError(
+            f"Gemini story generation failed: {gemini_error}"
+        )
+
+def ollama_generate(prompt):
+    response = requests.post(
+        CFG["ollama_url"],
 
 
 def clean_beat(beat):
