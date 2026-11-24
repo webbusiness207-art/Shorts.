@@ -47,6 +47,21 @@
       "ep": 9,
       "title": "Kevin's Laser Haircut Helmet",
       "summary": "Kevin tries a laser haircut helmet that instantly blasts all his hair off."
+    },
+    {
+      "ep": 10,
+      "title": "The Motel Safe Code Disaster",
+      "summary": "Kevin misinterprets a motel safe instructions poster and tries to crack it using fruit peels."
+    },
+    {
+      "ep": 11,
+      "title": "Kevin Becomes An NHL Star",
+      "summary": "Kevin straps ice skates on inside a supermarket to mimic a hockey superstar, causing instant dairy aisle chaos."
+    },
+    {
+      "ep": 12,
+      "title": "Kevin's Peace Treaty Negotiation",
+      "summary": "Kevin attempts to resolve a territorial dispute using garden gnomes, alarming Dave and a local pigeon."
     }
   ],
   "used_topics": [
@@ -59,5 +74,10 @@
     "cruise ship",
     "grand theft auto",
     "vanity fair taylor swift"
+  ],
+  "topics": [
+    "motel safe code",
+    "quinn hughes",
+    "geopolitical confusion"
   ]
 }
