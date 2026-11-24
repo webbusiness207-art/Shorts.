@@ -31,12 +31,31 @@ TODAY = dt.date.today().isoformat()
 OUT_DAY = ROOT / "output" / TODAY
 STATE_FILE = ROOT / "used_topics.json"
 
-SERIES_NAME = os.getenv("SERIES_NAME", "KEVIN'S WORST IDEAS")
+SERIES_NAME = os.getenv("SERIES_NAME") or "KEVIN'S WORST IDEAS"
+
+def env_int(name, default):
+    """Read an integer environment variable, treating blank values as missing."""
+    value = (os.getenv(name) or "").strip()
+    try:
+        return int(value) if value else default
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using {default}.")
+        return default
+
+def env_float(name, default):
+    """Read a float environment variable, treating blank values as missing."""
+    value = (os.getenv(name) or "").strip()
+    try:
+        return float(value) if value else default
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using {default}.")
+        return default
+
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 
 CFG = {
-    "videos_per_run": max(1, min(5, int(os.getenv("VIDEOS_PER_RUN", "3")))),
+    "videos_per_run": max(1, min(5, env_int("VIDEOS_PER_RUN", 3))),
     "visuals": os.getenv("VISUALS", "toon").lower(),
     "voice": os.getenv("VOICE", "en_US-lessac-medium"),
     "piper_bin": os.getenv("PIPER_BIN", "piper"),
@@ -48,7 +67,7 @@ CFG = {
         "OLLAMA_URL", "http://localhost:11434/api/generate"
     ),
     "ollama_model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
-    "music_volume": float(os.getenv("MUSIC_VOLUME", "0.075")),
+    "music_volume": max(0.0, min(1.0, env_float("MUSIC_VOLUME", 0.075))),
     "fps": 24,
     "width": 720,
     "height": 1280,
