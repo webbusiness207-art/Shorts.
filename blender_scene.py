@@ -53,7 +53,7 @@ Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 scene = bpy.context.scene
 
 if bpy.app.version >= (4, 0, 0):
-    scene.render.engine = "BLENDER_EEVEE_NEXT"
+    scene.render.engine = "BLENDER_EEVEE"
 else:
     scene.render.engine = "BLENDER_EEVEE"
 
