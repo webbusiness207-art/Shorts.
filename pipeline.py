@@ -880,7 +880,64 @@ def draw_visual_description(draw, text, font):
                            fill=(25, 25, 40), outline="white", width=2)
     draw.text((TW/2, 570), clean, font=font, fill="white", anchor="mm")
 
+def blender_background(beats, durations, folder):
+    import json
+    import subprocess
+    import shutil
+    from pathlib import Path
 
+    blender = shutil.which("blender")
+    if not blender:
+        raise RuntimeError("Blender is not installed.")
+
+    scene_script = Path(__file__).with_name("blender_scene.py")
+    if not scene_script.exists():
+        raise RuntimeError("blender_scene.py is missing.")
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    payload = folder / "blender_beats.json"
+    output = folder / "bg.mp4"
+
+    with open(payload, "w", encoding="utf-8") as f:
+        json.dump({
+            "beats": beats,
+            "durations": durations,
+            "width": 1080,
+            "height": 1920,
+            "fps": CFG["fps"]
+        }, f)
+
+    command = [
+        blender,
+        "-b",
+        "-t", "2",
+        "--python-exit-code", "1",
+        "--python", str(scene_script),
+        "--",
+        str(payload),
+        str(output)
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=5400
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Blender rendering failed:\n" +
+            result.stdout[-4000:] +
+            result.stderr[-4000:]
+        )
+
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError("Blender did not create the background video.")
+
+    return str(output), []
 def toon_background(beats, durations, folder):
     """Render portrait cartoon frames; crop bounds are clamped before resizing."""
     bgs = {}
@@ -1117,13 +1174,22 @@ def make_video(index):
     write_ass(words, beats, durations, episode_number, folder / "captions.ass")
 
     print("Rendering animated scenes...")
-    if CFG["visuals"] == "toon":
-        background, sources = toon_background(beats, durations, folder)
-    elif CFG["visuals"] == "stock":
-        background, sources = build_background(beats, durations, folder)
-    else:
-        raise ValueError("VISUALS must be 'toon' or 'stock'.")
-
+    if CFG["visuals"] == "blender":
+    background, sources = blender_background(
+        beats, durations, folder
+    )
+elif CFG["visuals"] == "toon":
+    background, sources = toon_background(
+        beats, durations, folder
+    )
+elif CFG["visuals"] == "stock":
+    background, sources = build_background(
+        beats, durations, folder
+    )
+else:
+    raise ValueError(
+        "VISUALS must be 'blender', 'toon', or 'stock'."
+)
     print("Compositing final Short...")
     music = render(
         background, folder / "voice.wav", folder,
@@ -1204,6 +1270,11 @@ def notify_video(path, caption):
 
 
 def preflight():
+   if CFG["visuals"] == "blender":
+    if not shutil.which("blender"):
+        raise RuntimeError("Blender executable not found.")
+    if not Path(__file__).with_name("blender_scene.py").exists():
+        raise RuntimeError("blender_scene.py not found.")
     errors = []
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
