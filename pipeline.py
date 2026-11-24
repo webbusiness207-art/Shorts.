@@ -1190,6 +1190,18 @@ else:
     raise ValueError(
         "VISUALS must be 'blender', 'toon', or 'stock'."
 )
+elif CFG["visuals"] == "toon":
+    background, sources = toon_background(
+        beats, durations, folder
+    )
+elif CFG["visuals"] == "stock":
+    background, sources = build_background(
+        beats, durations, folder
+    )
+else:
+    raise ValueError(
+        "VISUALS must be 'blender', 'toon', or 'stock'."
+)
     print("Compositing final Short...")
     music = render(
         background, folder / "voice.wav", folder,
