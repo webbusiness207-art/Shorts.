@@ -25,15 +25,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg blender fonts-dejavu-core espeak-ng
-          blender --version
+          blender --version | head -n 1
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install --upgrade Pillow soundfile faster-whisper requests huggingface_hub piper-tts
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Download Piper voice model
         run: |
@@ -47,7 +45,6 @@ jobs:
               "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
               "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
           ]
-          Path("models").mkdir(exist_ok=True)
           for filename in files:
               downloaded = hf_hub_download(
                   repo_id="rhasspy/piper-voices",
@@ -66,10 +63,11 @@ jobs:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NICHE: ${{ vars.NICHE }}
           VIDEOS_PER_RUN: ${{ vars.VIDEOS_PER_RUN }}
           PIPER_BIN: piper
           VISUALS: blender
+          BLENDER_ENGINE: CYCLES
+          BLENDER_SAMPLES: "24"
           VOICE: en_US-lessac-medium
         run: python -u pipeline.py
 
@@ -78,8 +76,8 @@ jobs:
         run: |
           git config user.name "shorts-bot"
           git config user.email "shorts-bot@users.noreply.github.com"
-          git add -A used_topics.json 2>/dev/null || true
-          git diff --cached --quiet || (git commit -m "Update topic history" && git push)
+          git add used_topics.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "Update topic history" && git pull --rebase && git push)
 
       - name: Keep videos and report
         if: always()
