@@ -1,3 +1,4 @@
+
 name: Daily Shorts
 
 on:
@@ -24,8 +25,13 @@ jobs:
       - name: Install system tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg blender fonts-dejavu-core espeak-ng
-          blender --version
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core espeak-ng curl xz-utils
+          blender_version="4.1.1"
+          curl -fL "https://download.blender.org/release/Blender4.1/blender-${blender_version}-linux-x64.tar.xz" -o /tmp/blender.tar.xz
+          tar -xJf /tmp/blender.tar.xz -C "$HOME"
+          echo "$HOME/blender-${blender_version}-linux-x64" >> "$GITHUB_PATH"
+          echo "Blender installed:"
+          "$HOME/blender-${blender_version}-linux-x64/blender" --version
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
