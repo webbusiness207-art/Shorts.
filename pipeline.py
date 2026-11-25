@@ -66,8 +66,8 @@ CFG = {
     # options: en-US-AndrewNeural, en-US-BrianNeural, en-US-GuyNeural,
     # en-US-ChristopherNeural. Female: en-US-AriaNeural, en-US-JennyNeural.
     "voice": os.getenv("VOICE", "").strip() or "en-US-AndrewNeural",
-    "voice_rate": os.getenv("VOICE_RATE", "").strip() or "+12%",
-    "voice_pitch": os.getenv("VOICE_PITCH", "").strip() or "+0Hz",
+    "voice_rate": os.getenv("VOICE_RATE", "").strip() or "+10%",
+    "voice_pitch": os.getenv("VOICE_PITCH", "").strip() or "-2Hz",
     # Piper is only the fallback if the neural voice cannot be reached.
     "piper_bin": os.getenv("PIPER_BIN", "piper"),
     "piper_model": os.getenv(
@@ -676,11 +676,21 @@ def ease(t):
 def pose_params(pose, emotion, t, u):
     """Animation state. Arms are (forward_angle, outward_angle)."""
     p = dict(al=(0.0, 0.08), ar=(0.0, 0.08), ll=0.0, lr=0.0, bob=0.0,
-             lean=0.0, tilt=0.0, mouth=0.0, dx=0.0, yaw=None, tears=False)
+             lean=0.0, tilt=0.0, mouth=0.0, dx=0.0, yaw=None, tears=False,
+             hyaw=0.0, sway=0.0)
     p["bob"] = math.sin(t * 2.3) * 0.035
     p["al"] = (math.sin(t * 1.6) * 0.05, 0.08)
     p["ar"] = (math.sin(t * 1.6 + 1) * 0.05, 0.08)
-
+    if pose == "idle":
+        # talking gestures: arm lifts and chops in bursts, head nods, weight shift
+        g = max(0.0, math.sin(t * 1.9 + 0.6)) ** 1.5
+        beat_ = math.sin(t * 8.0)
+        p["ar"] = (0.25 + 1.0 * g + 0.15 * beat_ * g, 0.15 + 0.2 * g)
+        g2 = max(0.0, math.sin(t * 1.3 + 2.4)) ** 2
+        p["al"] = (0.1 + 0.7 * g2, 0.12 + 0.15 * g2)
+        p["tilt"] = math.sin(t * 3.1) * 0.05 + 0.05 * g
+        p["sway"] = math.sin(t * 1.1) * 0.12
+        p["mouth"] = 0.0
     if pose in ("walk", "run"):
         spd = 7.0 if pose == "walk" else 12.0
         amp = 0.65 if pose == "walk" else 1.0
@@ -688,7 +698,7 @@ def pose_params(pose, emotion, t, u):
         p["ll"], p["lr"] = s * amp, -s * amp
         p["al"], p["ar"] = (-s * amp * 0.9, 0.08), (s * amp * 0.9, 0.08)
         p["bob"] = abs(math.cos(t * spd)) * (0.12 if pose == "walk" else 0.3)
-        p["dx"] = (u - 0.5) * (3.0 if pose == "walk" else 6.5)
+        p["dx"] = (u - 0.5) * (7.0 if pose == "walk" else 10.0)
         p["yaw"] = math.pi / 2
         p["lean"] = 0.0 if pose == "walk" else 0.22
     elif pose == "panic":
@@ -744,6 +754,7 @@ def pose_params(pose, emotion, t, u):
         p["al"], p["ar"] = (0.3, 0.75), (0.3, 0.75)
         p["tilt"] = 0.18 + math.sin(t * 2) * 0.04
 
+    p["hyaw"] = math.sin(t * 0.8) * 0.12
     if emotion == "sad" and pose in ("idle", "walk"):
         p["tilt"] = 0.25
         p["lean"] += 0.06
@@ -756,14 +767,30 @@ def pose_params(pose, emotion, t, u):
     return p
 
 
-def build_character(who, x, z, yaw, pose, emotion, t, u):
-    """Return list of boxes for one blocky character."""
+def build_character(who, x, z, yaw, pose, emotion, t, u, look=0.0, enter=None):
+    """Return list of boxes for one blocky character.
+    look  = extra head turn (radians) toward whoever they're talking to.
+    enter = (from_dx, progress 0..1): walk in from the side, then settle."""
     spec = ROSTER.get(who, ROSTER["hero"])
     s = spec["scale"]
     p = pose_params(pose, emotion, t, u)
+    if enter is not None and enter[1] < 1.0:
+        fx, k = enter
+        sp = 7.0
+        sw = math.sin(t * sp) * 0.65
+        p["ll"], p["lr"] = sw, -sw
+        p["al"], p["ar"] = (-sw * 0.9, 0.08), (sw * 0.9, 0.08)
+        p["bob"] = abs(math.cos(t * sp)) * 0.12
+        p["dx"] = fx * (1.0 - ease(k))
+        p["yaw"] = math.pi / 2 * (1 if fx < 0 else -1)
+        p["lean"] = 0.0
+        p["tilt"] = 0.0
+        p["mouth"] = 0.0
+    elif enter is not None and enter[1] < 1.35 and pose == "idle":
+        p["hyaw"] += 0.0
     if p["yaw"] is not None:
         yaw = p["yaw"]
-    Rg = rot_y(yaw) @ rot_x(p["lean"])
+    Rg = rot_y(yaw) @ rot_z(p["sway"]) @ rot_x(p["lean"])
     origin = np.array([x + p["dx"], 0.0, z])
     out = []
 
@@ -804,7 +831,7 @@ def build_character(who, x, z, yaw, pose, emotion, t, u):
         part((side * 1.45, 2.15, 0), (0.92, 0.7, 0.92), skin, R, piv)
 
     # head group (nods / tilts about the neck)
-    Rh = rot_x(p["tilt"])
+    Rh = rot_y(p["hyaw"] + look) @ rot_x(p["tilt"])
     neck = (0, 4.0, 0)
 
     def head_part(center, size, col, R=None, flat=False):
@@ -1340,7 +1367,8 @@ def compose_frame(scene, beat, bi, t, u, aspect=0.5625, dscale=1.0):
     boxes, decals = [], []
     used_x = []
 
-    for c, x in zip(people, xs):
+    new_scene = beat.get("_prev_scene") != beat["scene"]
+    for ci, (c, x) in enumerate(zip(people, xs)):
         pose, emo = c["pose"], c["emotion"]
         z = 3.2
         if pose == "sit":
@@ -1348,7 +1376,19 @@ def compose_frame(scene, beat, bi, t, u, aspect=0.5625, dscale=1.0):
             if scene.sit_z is None:
                 z = 3.4
         yaw = math.pi + az * 0.7 + (0.22 if x < 0 else -0.22 if x > 0 else 0.0)
-        bx, origin = build_character(c["who"], x, z, yaw, pose, emo, t, u)
+        # look toward the nearest other person (head only)
+        look = 0.0
+        others = [xx for xx in xs[:len(people)] if xx != x]
+        if others and pose not in ("walk", "run", "cry", "panic"):
+            tgt = min(others, key=lambda o: abs(o - x))
+            look = 0.55 if tgt > x else -0.55
+            look *= 0.6 + 0.4 * math.sin(t * 0.9 + ci)
+        enter = None
+        if (new_scene or c["who"] not in beat.get("_prev_who", [c["who"]])) \
+                and pose in ("idle", "point", "shrug") and t < 1.1:
+            side = -1 if (x < 0 or (x == 0 and bi % 2 == 0)) else 1
+            enter = (side * 7.5, t / 0.9)
+        bx, origin = build_character(c["who"], x, z, yaw, pose, emo, t, u, look, enter)
         boxes += bx
         decals.append(shadow_decal(origin, 1.5 * ROSTER[c["who"]]["scale"], scene.shadow))
         used_x.append(x)
@@ -1373,11 +1413,21 @@ def compose_frame(scene, beat, bi, t, u, aspect=0.5625, dscale=1.0):
 
     maxx = max([abs(x) for x in used_x] + [0.0])
     d = max(SHOT_DIST.get(beat["shot"], 26.0) * dscale, (maxx + 2.6) / (aspect * 0.414))
-    d *= 1.0 - 0.1 * ease(u)                       # slow push-in
+    style = bi % 4
+    if style == 0:
+        d *= 1.0 - 0.14 * ease(u)                  # push in
+    elif style == 1:
+        d *= 0.9 + 0.1 * ease(u)                   # pull out
+    elif style == 2:
+        d *= 0.97
+    else:
+        d *= 1.0 - 0.07 * ease(u)
     tx = (sum(used_x) / len(used_x)) * 0.5 if used_x else 0.0
-    target = np.array([tx, 3.6, 3.4])
-    ang = az + math.sin(bi * 1.3 + t * 0.35) * 0.04
-    pos = target + np.array([math.sin(ang) * d, d * 0.21, -math.cos(ang) * d])
+    target = np.array([tx, 3.6 + (0.5 if style == 2 else 0.0), 3.4])
+    drift = (u - 0.5) * (0.30 if style in (2, 3) else 0.10) * (1 if bi % 2 == 0 else -1)
+    ang = az + drift + math.sin(bi * 1.3 + t * 0.35) * 0.04
+    lift = (0.21, 0.12, 0.30, 0.18)[style]         # camera height: low / high angles
+    pos = target + np.array([math.sin(ang) * d, d * lift, -math.cos(ang) * d])
     if beat["fx"] == "shake" and t < 0.55:
         k = (1 - t / 0.55) * 0.35
         pos = pos + np.array([math.sin(t * 90) * k, math.cos(t * 77) * k, 0])
@@ -1666,6 +1716,33 @@ def synthesize_edge(text, out_path):
     raise RuntimeError("edge-tts failed: " + last)
 
 
+SAMPLE_VOICES = [
+    ("en-US-AndrewNeural", "+10%", "-2Hz"), ("en-US-BrianNeural", "+10%", "-2Hz"),
+    ("en-US-GuyNeural", "+8%", "-2Hz"), ("en-US-ChristopherNeural", "+10%", "+0Hz"),
+    ("en-US-EricNeural", "+10%", "-2Hz"), ("en-US-RogerNeural", "+10%", "+0Hz"),
+    ("en-US-SteffanNeural", "+10%", "-2Hz"), ("en-GB-RyanNeural", "+10%", "+0Hz"),
+    ("en-AU-WilliamNeural", "+10%", "+0Hz"), ("en-US-AndrewMultilingualNeural", "+10%", "-2Hz"),
+    ("en-US-BrianMultilingualNeural", "+10%", "-2Hz"),
+]
+
+
+def make_voice_samples():
+    """VOICE=samples -> one short clip per voice so you can listen and pick."""
+    d = OUT_DAY / "voice_samples"
+    d.mkdir(parents=True, exist_ok=True)
+    line = ("Bro walked into the bathroom, no cap, and the cop was already there. "
+            "He is so cooked. Only in Ohio.")
+    old = (CFG["voice"], CFG["voice_rate"], CFG["voice_pitch"])
+    for name, rate, pitch in SAMPLE_VOICES:
+        CFG["voice"], CFG["voice_rate"], CFG["voice_pitch"] = name, rate, pitch
+        try:
+            synthesize_edge(line, d / f"{name}.mp3")
+            print("sample ok:", name)
+        except Exception as exc:
+            print("sample failed:", name, exc)
+    CFG["voice"], CFG["voice_rate"], CFG["voice_pitch"] = old
+
+
 def synthesize_piper(text, out_path):
     binary = CFG["piper_bin"]
     if not shutil.which(binary) and not Path(binary).exists():
@@ -1800,6 +1877,9 @@ def build_timeline(beats, durations):
 
     for i, (beat, dur) in enumerate(zip(beats, durations)):
         beat["_t0"] = t
+        pv = beats[i - 1] if i else None
+        beat["_prev_scene"] = pv["scene"] if pv else None
+        beat["_prev_who"] = [c["who"] for c in pv["cast"]] if pv else []
         beat["_dur"] = max(1.3 if br else 1.7, dur) + (0.45 if i == len(beats) - 1 else 0.0)
         speech = max(0.4, dur - 0.2)
         if br and i == 0:
@@ -2332,6 +2412,12 @@ def preflight():
 
 def main():
     OUT_DAY.mkdir(parents=True, exist_ok=True)
+
+    if CFG["voice"].lower() == "samples":
+        make_voice_samples()
+        print("Voice samples saved in output/.../voice_samples. Download the artifact, "
+              "listen, then set the VOICE variable to the file name you like.")
+        return
 
     print("Starting Shorts Factory v5 (blocky 3D story style)...")
     print("Videos requested:", CFG["videos_per_run"], "| demo story:", CFG["demo"])
