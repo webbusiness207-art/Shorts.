@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Shorts Factory v4 - "Huss Huss Huss" format Shorts.
+"""Shorts Factory v5 - blocky 3D "story explainer" Shorts.
 
-A deadpan blocky avatar explains that everybody in town goes out partying
-except him, because he is secretly grinding one skill. Between lines he does
-the skill and breathes "Huss, huss, huss."
+A narrator tells a short, funny "what happens when you..." story. Blocky
+characters act it out in furnished 3D rooms while red/purple consequence tags
+stack up, a trouble bar changes colour and key words are highlighted.
+Everything is rendered in Python (Pillow + numpy): no Blender, no GPU.
 """
 
+import asyncio  # noqa: F401  (kept so edge-tts works on every Python 3.x)
 import datetime as dt
 import json
 import math
@@ -20,6 +22,7 @@ import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
@@ -31,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 TODAY = dt.date.today().isoformat()
 OUT_DAY = ROOT / "output" / TODAY
 STATE_FILE = ROOT / "used_topics.json"
-SERIES_NAME = os.getenv("SERIES_NAME", "IN THIS TOWN")
+SERIES_NAME = os.getenv("SERIES_NAME", "DUMB MOVES")
 
 
 def env_int(name, default):
@@ -52,9 +55,15 @@ VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 
 CFG = {
-    "videos_per_run": max(1, min(5, env_int("VIDEOS_PER_RUN", 3))),
-    "visuals": os.getenv("VISUALS", "toon").lower().strip(),
-    "voice": os.getenv("VOICE", "en_US-lessac-medium"),
+    "videos_per_run": max(1, min(5, env_int("VIDEOS_PER_RUN", 1))),
+    "demo": os.getenv("DEMO", "0").strip() == "1",
+    # Natural-sounding Microsoft neural voice (free, no key). Good male
+    # options: en-US-AndrewNeural, en-US-BrianNeural, en-US-GuyNeural,
+    # en-US-ChristopherNeural. Female: en-US-AriaNeural, en-US-JennyNeural.
+    "voice": os.getenv("VOICE", "").strip() or "en-US-AndrewNeural",
+    "voice_rate": os.getenv("VOICE_RATE", "").strip() or "+8%",
+    "voice_pitch": os.getenv("VOICE_PITCH", "").strip() or "+0Hz",
+    # Piper is only the fallback if the neural voice cannot be reached.
     "piper_bin": os.getenv("PIPER_BIN", "piper"),
     "piper_model": os.getenv(
         "PIPER_MODEL", str(ROOT / "models" / "en_US-lessac-medium.onnx")
@@ -62,36 +71,48 @@ CFG = {
     "gemini_model": os.getenv("GEMINI_MODEL", "").strip(),
     "ollama_url": os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate"),
     "ollama_model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
-    "music_volume": max(0, min(1, env_float("MUSIC_VOLUME", 0.075))),
-    "fps": 24,
-    "blender_fps": env_int("BLENDER_FPS", 18),
-    "width": 720,
-    "height": 1280,
-    "use_whisper": os.getenv("USE_WHISPER", "0") == "1",
+    "music_volume": max(0, min(1, env_float("MUSIC_VOLUME", 0.06))),
+    "fps": env_int("FPS", 24),
+    "width": 1080,
+    "height": 1920,
+    # Scene is drawn at this multiple of the final size, then shrunk
+    # (smooth edges). 1.0 = fastest, 1.5 = nicer, 2.0 = best/slowest.
+    "supersample": env_float("SUPERSAMPLE", 1.5),
 }
 
 TW, TH, FPS = CFG["width"], CFG["height"], CFG["fps"]
-INK = (27, 31, 43)
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 TRENDS_URL = "https://trends.google.com/trending/rss?geo=US"
 
-# Vocabulary shared by the story prompt, the validator and both renderers.
-SCENES = {
-    "classroom", "bedroom", "kitchen", "office", "lab",
-    "stage", "street", "city_night", "park", "space",
+# Vocabulary shared by the story prompt, the validator and the renderer.
+SCENES = [
+    "bathroom", "hallway", "office", "classroom", "kitchen",
+    "street", "park", "security_room", "store",
+]
+WHO = ["hero", "friend", "kid", "cop", "boss", "teacher", "parent", "pigeon"]
+POSES = [
+    "idle", "walk", "run", "panic", "shock", "point",
+    "cry", "celebrate", "sit", "fall", "shrug",
+]
+EMOTIONS = ["neutral", "happy", "shock", "scared", "angry", "sad", "smug"]
+SHOTS = ["wide", "medium", "close"]
+CHIP_COLORS = {
+    "red": (225, 35, 55),
+    "purple": (112, 52, 190),
+    "blue": (40, 105, 225),
+    "orange": (245, 135, 25),
+    "green": (40, 165, 90),
 }
-EMOTIONS = {"neutral", "happy", "shock", "scared", "angry", "sad"}
-ACTIONS = {"idle", "jump", "panic", "point", "shake", "slide", "huss"}
-EFFECTS = {"none", "explosion", "fire", "shock", "sparkle"}
-ACTIVITIES = {
-    "basketball", "jump_rope", "weights", "boxing", "running", "typing",
+TROUBLE = {
+    "big": ("BIG TROUBLE", (225, 35, 55)),
+    "some": ("SOME TROUBLE", (245, 135, 25)),
+    "none": ("NO TROUBLE", (40, 175, 95)),
 }
-PERIOD = 0.42  # seconds per "huss" repetition
 
 
 # ---------------------------------------------------------------------
-# UTILITIES
+# UTILITIES + LLM (story text generation)
 # ---------------------------------------------------------------------
 
 def run(command, cwd=None, check=True):
@@ -382,144 +403,1057 @@ def llm_json(prompt):
         raise RuntimeError(f"Gemini story generation failed: {gemini_error}")
 
 
-def clean_beat(beat, default_activity):
+# ---------------------------------------------------------------------
+# TINY 3D ENGINE (flat-shaded blocks, painter's algorithm)
+# ---------------------------------------------------------------------
+
+NEAR = 0.5
+LIGHT = np.array([-0.35, 0.8, -0.5])
+LIGHT = LIGHT / np.linalg.norm(LIGHT)
+
+
+def rot_x(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def rot_y(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def rot_z(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def mulc(col, k):
+    return tuple(int(clamp(c * k, 0, 255)) for c in col)
+
+
+def box(center, size, col, R=None, flat=False):
+    """A block: centre, 3 half-axis vectors (rows of A), colour."""
+    half = np.diag(np.array(size, float) / 2)
+    m = half if R is None else R @ half
+    return (np.array(center, float), m.T.copy(), col, flat)
+
+
+class Camera:
+    def __init__(self, pos, target, fov=45.0):
+        self.pos = np.array(pos, float)
+        fwd = np.array(target, float) - self.pos
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross([0, 1, 0], fwd)
+        right /= np.linalg.norm(right)
+        up = np.cross(fwd, right)
+        self.basis = np.stack([right, up, fwd])
+        self.tan = math.tan(math.radians(fov) / 2)
+
+    def to_cam(self, p):
+        return (p - self.pos) @ self.basis.T
+
+
+def clip_near(poly):
+    """Clip a camera-space polygon against the near plane."""
+    out = []
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        ain, bin_ = a[2] >= NEAR, b[2] >= NEAR
+        if ain:
+            out.append(a)
+        if ain != bin_:
+            t = (NEAR - a[2]) / (b[2] - a[2])
+            out.append([a[0] + (b[0] - a[0]) * t,
+                        a[1] + (b[1] - a[1]) * t, NEAR])
+    return out
+
+
+def project(poly, f, cx, cy):
+    return [(cx + f * p[0] / p[2], cy - f * p[1] / p[2]) for p in poly]
+
+
+class Scene:
+    """Static quads/boxes of one room, plus optional animated extras."""
+
+    def __init__(self, name):
+        self.name = name
+        self.quads = []      # (4 world points, colour)
+        self.boxes = []
+        self.bg = ((20, 20, 40), (60, 60, 90))
+        self.shadow = (40, 40, 50)
+        self.dynamic = None  # fn(t) -> list of boxes
+        self._qv = None
+
+    # ----- builders
+    def quad(self, p, col):
+        self.quads.append((np.array(p, float), col))
+
+    def block(self, center, size, col, flat=False):
+        self.boxes.append(box(center, size, col, flat=flat))
+
+    def floor(self, a, b, tile=2.0, x0=-8, x1=8, z0=-26, z1=9):
+        xs = np.arange(x0, x1, tile)
+        zs = np.arange(z0, z1, tile)
+        for i, x in enumerate(xs):
+            for j, z in enumerate(zs):
+                col = a if (i + j) % 2 == 0 else b
+                self.quad([(x, 0, z), (x + tile, 0, z),
+                           (x + tile, 0, z + tile), (x, 0, z + tile)], col)
+
+    def back_wall(self, col, z=9, x0=-8, x1=8, h=11):
+        self.quad([(x0, 0, z), (x1, 0, z), (x1, h, z), (x0, h, z)], col)
+
+    def side_walls(self, col_l, col_r=None, x=8, z0=-26, z1=9, h=11):
+        col_r = col_r or col_l
+        self.quad([(-x, 0, z0), (-x, 0, z1), (-x, h, z1), (-x, h, z0)], col_l)
+        self.quad([(x, 0, z0), (x, 0, z1), (x, h, z1), (x, h, z0)], col_r)
+
+    def back_rect(self, x0, x1, y0, y1, col, z=8.97):
+        self.quad([(x0, y0, z), (x1, y0, z), (x1, y1, z), (x0, y1, z)], col)
+
+    def wall_tiles(self, col_a, col_b, tile=2.0, h=10, z=8.98, x0=-8, x1=8):
+        xs = np.arange(x0, x1, tile)
+        for i, x in enumerate(xs):
+            for j in range(int(h / tile)):
+                col = col_a if (i + j) % 2 == 0 else col_b
+                y = j * tile
+                self.quad([(x, y, z), (x + tile, y, z),
+                           (x + tile, y + tile, z), (x, y + tile, z)], col)
+
+    def side_tiles(self, side, col_a, col_b, tile=2.0, h=10, z0=-26, z1=9):
+        x = -7.98 if side < 0 else 7.98
+        for i, z in enumerate(np.arange(z0, z1, tile)):
+            for j in range(int(h / tile)):
+                col = col_a if (i + j) % 2 == 0 else col_b
+                y = j * tile
+                self.quad([(x, y, z), (x, y, z + tile),
+                           (x, y + tile, z + tile), (x, y + tile, z)], col)
+
+    def side_rect(self, side, z0, z1, y0, y1, col):
+        x = -7.95 if side < 0 else 7.95
+        self.quad([(x, y0, z0), (x, y0, z1), (x, y1, z1), (x, y1, z0)], col)
+
+    def finalize(self):
+        self._qv = np.array([q[0] for q in self.quads]) if self.quads else None
+        self._qc = [q[1] for q in self.quads]
+        self.static = None
+        if self.boxes:
+            self.static = (
+                np.array([b[0] for b in self.boxes]),
+                np.array([b[1] for b in self.boxes]),
+                [b[2] for b in self.boxes],
+                [b[3] for b in self.boxes],
+            )
+
+
+def _face_geometry(C, A):
+    """All 6 faces of every box: corners, centres, normals."""
+    corners, centres, normals = [], [], []
+    for k in range(3):
+        ax = A[:, k, :]
+        u = A[:, (k + 1) % 3, :]
+        v = A[:, (k + 2) % 3, :]
+        nrm = ax / np.maximum(np.linalg.norm(ax, axis=1, keepdims=True), 1e-9)
+        for s in (1, -1):
+            fc = C + s * ax
+            corners.append(np.stack([fc + u + v, fc - u + v, fc - u - v, fc + u - v], 1))
+            centres.append(fc)
+            normals.append(s * nrm)
+    return (np.stack(corners, 1), np.stack(centres, 1), np.stack(normals, 1))
+
+
+def draw_world(draw, cam, scene, dyn_boxes, RW, RH):
+    f = (RH / 2) / cam.tan
+    cx, cy = RW / 2, RH / 2
+
+    # ---- static quads (room shell and wall decoration), in listed order
+    if scene._qv is not None:
+        cq = cam.to_cam(scene._qv)
+        for i in range(len(cq)):
+            poly = cq[i]
+            if poly[:, 2].min() < NEAR:
+                poly = clip_near(poly.tolist())
+                if len(poly) < 3:
+                    continue
+                pts = project(poly, f, cx, cy)
+            else:
+                pts = project(poly.tolist(), f, cx, cy)
+            col = scene._qc[i]
+            draw.polygon(pts, fill=col, outline=mulc(col, 0.8))
+
+    # ---- soft shadows under characters
+    for pts, col in (dyn_boxes.get("decals", []) if isinstance(dyn_boxes, dict) else []):
+        cp = cam.to_cam(np.array(pts, float))
+        if cp[:, 2].min() > NEAR:
+            draw.polygon(project(cp.tolist(), f, cx, cy), fill=col)
+
+    boxes = dyn_boxes["boxes"] if isinstance(dyn_boxes, dict) else dyn_boxes
+    Cs, As, cols, flats = [], [], [], []
+    if scene.static is not None:
+        Cs.append(scene.static[0]); As.append(scene.static[1])
+        cols += scene.static[2]; flats += scene.static[3]
+    if boxes:
+        Cs.append(np.array([b[0] for b in boxes]))
+        As.append(np.array([b[1] for b in boxes]))
+        cols += [b[2] for b in boxes]; flats += [b[3] for b in boxes]
+    if not Cs:
+        return
+    C = np.concatenate(Cs); A = np.concatenate(As)
+
+    corners, centres, normals = _face_geometry(C, A)          # (N,6,...)
+    visible = ((cam.pos - centres) * normals).sum(-1) > 0     # (N,6)
+    shade = 0.55 + 0.45 * np.clip(normals @ LIGHT, 0, 1)      # (N,6)
+    ccam = cam.to_cam(corners)                                # (N,6,4,3)
+    fz = cam.to_cam(centres)[..., 2]                          # (N,6)
+    bz = cam.to_cam(C)[:, 2]                                  # (N,)
+
+    faces = []
+    idx = np.argwhere(visible & (fz > 0.1))
+    for n, k in idx:
+        poly = ccam[n, k]
+        if poly[:, 2].min() < NEAR:
+            poly = clip_near(poly.tolist())
+            if len(poly) < 3:
+                continue
+        else:
+            poly = poly.tolist()
+        col = cols[n]
+        sh = 1.0 if flats[n] else shade[n, k]
+        faces.append((-bz[n], -fz[n, k], poly, mulc(col, sh), mulc(col, sh * 0.6)))
+    faces.sort(key=lambda t: (t[0], t[1]))
+    for _, _, poly, fill, line in faces:
+        draw.polygon(project(poly, f, cx, cy), fill=fill, outline=line)
+
+
+# ---------------------------------------------------------------------
+# CHARACTERS
+# ---------------------------------------------------------------------
+
+ROSTER = {
+    "hero": dict(shirt=(240, 150, 40), pants=(55, 62, 95), skin=(240, 190, 150),
+                 hair=(95, 55, 30), style="short", scale=1.0),
+    "friend": dict(shirt=(70, 180, 95), pants=(60, 70, 100), skin=(190, 130, 95),
+                   hair=(30, 25, 25), style="short", scale=1.0),
+    "kid": dict(shirt=(225, 65, 65), pants=(50, 90, 140), skin=(245, 205, 170),
+                hair=(235, 195, 70), style="short", scale=0.8),
+    "cop": dict(shirt=(40, 72, 155), pants=(28, 38, 80), skin=(220, 170, 130),
+                hair=(40, 30, 25), style="short", scale=1.05, extras=("cop",)),
+    "boss": dict(shirt=(100, 105, 120), pants=(50, 52, 62), skin=(210, 160, 120),
+                 hair=(205, 205, 210), style="grey", scale=1.05,
+                 extras=("tie", "glasses")),
+    "teacher": dict(shirt=(155, 85, 195), pants=(60, 50, 85), skin=(235, 185, 150),
+                    hair=(125, 65, 40), style="long", scale=1.0),
+    "parent": dict(shirt=(65, 125, 205), pants=(75, 75, 88), skin=(225, 175, 135),
+                   hair=(65, 45, 35), style="bun", scale=1.0),
+}
+DARK = (30, 28, 38)
+SHOE = (42, 40, 52)
+
+
+def ease_out_back(t):
+    t = clamp(t, 0, 1)
+    c1, c3 = 1.70158, 2.70158
+    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+
+def ease(t):
+    t = clamp(t, 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def pose_params(pose, emotion, t, u):
+    """Animation state. Arms are (forward_angle, outward_angle)."""
+    p = dict(al=(0.0, 0.08), ar=(0.0, 0.08), ll=0.0, lr=0.0, bob=0.0,
+             lean=0.0, tilt=0.0, mouth=0.0, dx=0.0, yaw=None, tears=False)
+    p["bob"] = math.sin(t * 2.3) * 0.035
+    p["al"] = (math.sin(t * 1.6) * 0.05, 0.08)
+    p["ar"] = (math.sin(t * 1.6 + 1) * 0.05, 0.08)
+
+    if pose in ("walk", "run"):
+        spd = 7.0 if pose == "walk" else 12.0
+        amp = 0.65 if pose == "walk" else 1.0
+        s = math.sin(t * spd)
+        p["ll"], p["lr"] = s * amp, -s * amp
+        p["al"], p["ar"] = (-s * amp * 0.9, 0.08), (s * amp * 0.9, 0.08)
+        p["bob"] = abs(math.cos(t * spd)) * (0.12 if pose == "walk" else 0.3)
+        p["dx"] = (u - 0.5) * (3.0 if pose == "walk" else 6.5)
+        p["yaw"] = math.pi / 2
+        p["lean"] = 0.0 if pose == "walk" else 0.22
+    elif pose == "panic":
+        p["bob"] = abs(math.sin(t * 9)) * 0.45
+        flap = math.sin(t * 16) * 0.25
+        p["al"], p["ar"] = (0.2, 2.5 + flap), (0.2, 2.5 - flap)
+        p["ll"], p["lr"] = math.sin(t * 9) * 0.5, -math.sin(t * 9) * 0.5
+        p["mouth"] = 1.0
+    elif pose == "shock":
+        jump = math.sin(math.pi * clamp(t / 0.3, 0, 1)) * 0.9
+        p["bob"] = jump
+        p["al"], p["ar"] = (0.3, 0.9), (0.3, 0.9)
+        p["mouth"] = 1.0
+        p["bob"] += math.sin(t * 40) * 0.015
+    elif pose == "point":
+        p["ar"] = (1.5, 0.12)
+        p["tilt"] = 0.05
+        if emotion == "angry":
+            p["mouth"] = 0.5 + 0.5 * math.sin(t * 13)
+            p["bob"] += abs(math.sin(t * 6.5)) * 0.08
+    elif pose == "cry":
+        p["al"], p["ar"] = (2.25, 0.25), (2.25, 0.25)
+        p["tilt"] = 0.28
+        p["bob"] = math.sin(t * 14) * 0.07
+        p["dx"] = math.sin(t * 26) * 0.04
+        p["tears"] = True
+        p["mouth"] = 0.6
+    elif pose == "celebrate":
+        p["bob"] = abs(math.sin(t * 6)) * 0.7
+        p["al"] = (0.2, 2.7 + math.sin(t * 12) * 0.3)
+        p["ar"] = (0.2, 2.7 - math.sin(t * 12) * 0.3)
+        p["ll"], p["lr"] = math.sin(t * 6) * 0.3, -math.sin(t * 6) * 0.3
+    elif pose == "sit":
+        p["bob"] = -1.05
+        p["ll"] = p["lr"] = 1.55
+        p["al"], p["ar"] = (0.9 + math.sin(t * 9) * 0.08, 0.1), (0.9 - math.sin(t * 9) * 0.08, 0.1)
+    elif pose == "fall":
+        k = clamp(t / 0.35, 0, 1)
+        p["lean"] = -1.45 * ease(k)
+        p["bob"] = 0.55 * abs(math.sin(p["lean"]))
+        p["al"], p["ar"] = (0.4, 1.6), (0.4, 1.6)
+        p["mouth"] = 1.0
+    elif pose == "shrug":
+        p["al"], p["ar"] = (0.3, 0.75), (0.3, 0.75)
+        p["tilt"] = 0.18 + math.sin(t * 2) * 0.04
+
+    if emotion == "sad" and pose in ("idle", "walk"):
+        p["tilt"] = 0.25
+        p["lean"] += 0.06
+    if emotion in ("shock", "scared") and not p["mouth"]:
+        p["mouth"] = 0.8
+    if emotion == "scared":
+        p["dx"] += math.sin(t * 30) * 0.035
+    if emotion == "angry" and not p["mouth"] and pose == "idle":
+        p["mouth"] = 0.0
+    return p
+
+
+def build_character(who, x, z, yaw, pose, emotion, t, u):
+    """Return list of boxes for one blocky character."""
+    spec = ROSTER.get(who, ROSTER["hero"])
+    s = spec["scale"]
+    p = pose_params(pose, emotion, t, u)
+    if p["yaw"] is not None:
+        yaw = p["yaw"]
+    Rg = rot_y(yaw) @ rot_x(p["lean"])
+    origin = np.array([x + p["dx"], 0.0, z])
+    out = []
+
+    def part(center, size, col, R=None, pivot=None, flat=False):
+        c = np.array(center, float)
+        Rl = np.eye(3)
+        if R is not None:
+            piv = np.array(pivot if pivot is not None else center, float)
+            c = piv + R @ (c - piv)
+            Rl = R
+        c = c + np.array([0, p["bob"], 0])
+        cw = origin + s * (Rg @ c)
+        out.append(box(cw, np.array(size, float) * s, col, R=Rg @ Rl, flat=flat))
+
+    shirt, pants, skin, hair = spec["shirt"], spec["pants"], spec["skin"], spec["hair"]
+
+    # legs + shoes
+    for side, ang in ((-1, p["ll"]), (1, p["lr"])):
+        R = rot_x(-ang)
+        piv = (side * 0.5, 2.0, 0)
+        part((side * 0.5, 1.0, 0), (0.92, 2.0, 0.92), pants, R, piv)
+        part((side * 0.5, 0.18, 0.12), (0.98, 0.36, 1.2), SHOE, R, piv)
+
+    # torso
+    part((0, 3.0, 0), (2.0, 2.0, 1.0), shirt)
+    if "tie" in spec.get("extras", ()):
+        part((0, 3.25, 0.52), (0.3, 1.3, 0.05), (190, 30, 45))
+        part((0, 3.95, 0.52), (0.9, 0.22, 0.05), (235, 235, 240))
+    if "cop" in spec.get("extras", ()):
+        part((-0.55, 3.45, 0.52), (0.38, 0.38, 0.05), (245, 200, 60))
+        part((0, 2.12, 0.0), (2.04, 0.22, 1.04), (30, 30, 36))
+
+    # arms (upper sleeve + hand)
+    for side, (fw, out_a) in ((-1, p["al"]), (1, p["ar"])):
+        R = rot_z(side * out_a) @ rot_x(-fw)
+        piv = (side * 1.45, 3.9, 0)
+        part((side * 1.45, 3.2, 0), (0.92, 1.5, 0.92), shirt, R, piv)
+        part((side * 1.45, 2.15, 0), (0.92, 0.7, 0.92), skin, R, piv)
+
+    # head group (nods / tilts about the neck)
+    Rh = rot_x(p["tilt"])
+    neck = (0, 4.0, 0)
+
+    def head_part(center, size, col, R=None, flat=False):
+        c = np.array(center, float)
+        if R is None:
+            part(c, size, col, Rh, neck, flat)
+        else:
+            c1 = np.array(neck) + Rh @ (c - np.array(neck))
+            part(c1, size, col, Rh @ R, c1, flat)
+
+    hy = 4.9
+    head_part((0, hy, 0), (1.6, 1.6, 1.6), skin)
+
+    # hair
+    style = spec["style"]
+    head_part((0, hy + 0.78, 0), (1.72, 0.42, 1.72), hair)
+    head_part((0, hy + 0.6, 0.78), (1.72, 0.3, 0.3), hair)
+    head_part((0, hy + 0.1, -0.8), (1.72, 1.4, 0.3), hair)
+    if style == "long":
+        for sx in (-1, 1):
+            head_part((sx * 0.9, hy - 0.5, -0.1), (0.3, 2.2, 1.6), hair)
+    elif style == "bun":
+        head_part((0, hy + 1.25, -0.2), (0.7, 0.6, 0.7), hair)
+    elif style == "grey":
+        pass
+    if "cop" in spec.get("extras", ()):
+        head_part((0, hy + 0.95, 0), (1.95, 0.55, 1.95), (30, 50, 110))
+        head_part((0, hy + 0.78, 1.0), (1.6, 0.12, 0.7), (20, 28, 60))
+        head_part((0, hy + 1.0, 0.99), (0.4, 0.3, 0.05), (245, 200, 60))
+
+    # face
+    blink = ((t + sum(map(ord, who)) % 7) % 3.4) < 0.12
+    big = emotion in ("shock", "scared") or pose in ("shock", "panic", "fall")
+    ew = 0.3 if big else 0.22
+    eh = 0.08 if blink else (0.5 if big else 0.34)
+    ey = hy + 0.12
+    for sx in (-1, 1):
+        if big:
+            head_part((sx * 0.4, ey, 0.82), (0.44, 0.56, 0.05), (250, 250, 250))
+        head_part((sx * 0.4, ey, 0.85 if big else 0.82), (ew, eh, 0.06), DARK)
+    if emotion == "angry":
+        for sx in (-1, 1):
+            head_part((sx * 0.4, ey + 0.38, 0.84), (0.5, 0.1, 0.05), DARK,
+                      R=rot_z(-sx * 0.45))
+    elif emotion in ("sad", "scared"):
+        for sx in (-1, 1):
+            head_part((sx * 0.4, ey + 0.4, 0.84), (0.46, 0.09, 0.05), DARK,
+                      R=rot_z(sx * 0.35))
+    elif emotion == "smug":
+        for sx in (-1, 1):
+            head_part((sx * 0.4, ey + 0.28, 0.84), (0.5, 0.09, 0.05), DARK,
+                      R=rot_z(-sx * 0.12))
+
+    my = hy - 0.42
+    if p["mouth"] > 0.05:
+        head_part((0, my - 0.1 * p["mouth"], 0.82),
+                  (0.5 + 0.1 * p["mouth"], 0.12 + 0.45 * p["mouth"], 0.05), (80, 15, 28))
+    elif emotion in ("happy", "smug") or pose == "celebrate":
+        head_part((0, my - 0.06, 0.82), (0.62, 0.1, 0.05), DARK)
+        for sx in (-1, 1):
+            head_part((sx * 0.36, my + 0.04, 0.82), (0.1, 0.18, 0.05), DARK)
+    elif emotion in ("sad", "angry"):
+        head_part((0, my - 0.05, 0.82), (0.5, 0.1, 0.05), DARK)
+        for sx in (-1, 1):
+            head_part((sx * 0.28, my - 0.14, 0.82), (0.1, 0.16, 0.05), DARK)
+    else:
+        head_part((0, my, 0.82), (0.5, 0.09, 0.05), DARK)
+
+    if "glasses" in spec.get("extras", ()):
+        for sx in (-1, 1):
+            head_part((sx * 0.4, ey, 0.9), (0.62, 0.52, 0.04), (35, 35, 45))
+            head_part((sx * 0.4, ey, 0.92), (0.5, 0.4, 0.05), (190, 225, 245))
+        head_part((0, ey + 0.1, 0.9), (0.3, 0.06, 0.04), (35, 35, 45))
+
+    if p["tears"]:
+        for sx in (-1, 1):
+            ty = ey - 0.35 - ((t * 1.6 + (0.5 if sx > 0 else 0)) % 1.0) * 0.5
+            head_part((sx * 0.45, ty, 0.84), (0.14, 0.3, 0.05), (90, 170, 255))
+    return out, origin
+
+
+def build_pigeon(x, z, t, yaw=math.pi):
+    R = rot_y(yaw)
+    o = np.array([x, 0.0, z])
+    bob = abs(math.sin(t * 5)) * 0.08
+    peck = max(0.0, math.sin(t * 2.2)) ** 6 * 0.35
+    out = []
+
+    def part(c, size, col):
+        out.append(box(o + R @ (np.array(c, float) + [0, bob, 0]), size, col, R=R))
+
+    part((0, 1.3, 0), (1.5, 1.2, 2.1), (130, 140, 160))
+    part((0.82, 1.3, -0.1), (0.2, 0.8, 1.2), (95, 105, 128))
+    part((-0.82, 1.3, -0.1), (0.2, 0.8, 1.2), (95, 105, 128))
+    part((0, 2.15 - peck, 0.9 + peck), (0.85, 0.85, 0.85), (120, 135, 160))
+    part((0, 2.1 - peck, 1.45 + peck), (0.25, 0.2, 0.45), (250, 150, 40))
+    for sx in (-1, 1):
+        part((sx * 0.3, 2.25 - peck, 1.3 + peck), (0.12, 0.14, 0.06), DARK)
+        part((sx * 0.35, 0.45, 0.1), (0.14, 0.9, 0.14), (240, 130, 40))
+        part((sx * 0.35, 0.05, 0.28), (0.3, 0.1, 0.5), (240, 130, 40))
+    part((0, 1.55, 0.62), (1.4, 0.4, 0.4), (150, 120, 190))
+    return out, o
+
+
+def shadow_decal(origin, r, col):
+    pts = []
+    for i in range(10):
+        a = i / 10 * math.tau
+        pts.append((origin[0] + math.cos(a) * r, 0.03, origin[2] + math.sin(a) * r * 0.7))
+    return pts, col
+
+
+# ---------------------------------------------------------------------
+# ROOMS
+# ---------------------------------------------------------------------
+
+def scene_bathroom():
+    s = Scene("bathroom")
+    s.bg = ((205, 222, 210), (160, 185, 170)); s.shadow = (125, 145, 140)
+    s.floor((190, 200, 205), (172, 184, 190))
+    s.back_wall((150, 205, 170)); s.wall_tiles((168, 218, 188), (152, 204, 172))
+    s.side_walls((140, 195, 160))
+    s.side_tiles(-1, (160, 212, 180), (146, 198, 166), z0=-14)
+    s.side_tiles(1, (160, 212, 180), (146, 198, 166), z0=-14)
+    for x in (-4.2, 0, 4.2):
+        s.block((x, 3.6, 7.0), (3.9, 6.2, 0.15), (88, 170, 176))
+        s.block((x + 1.3, 3.4, 6.9), (0.2, 0.5, 0.15), (60, 60, 70))
+    for x in (-6.3, -2.1, 2.1, 6.3):
+        s.block((x, 3.6, 8.2), (0.15, 6.2, 2.9), (78, 155, 162))
+    s.block((6.6, 1.6, 3.0), (2.4, 3.2, 7.0), (232, 234, 240))
+    for z in (1.2, 4.8):
+        s.block((6.4, 3.4, z), (1.4, 0.25, 1.6), (70, 110, 160))
+        s.block((7.4, 3.9, z), (0.3, 0.7, 0.3), (190, 195, 205))
+    s.side_rect(1, 0.0, 6.5, 4.6, 9.0, (205, 235, 245))
+    s.side_rect(1, 0.3, 6.2, 4.9, 8.7, (175, 215, 235))
+    s.block((-6.4, 0.9, 2.2), (1.3, 1.8, 1.3), (110, 118, 130))
+    s.block((-7.4, 5.0, 4.5), (0.5, 1.2, 1.3), (225, 228, 235))
+    s.finalize(); return s
+
+
+def scene_hallway():
+    s = Scene("hallway")
+    s.bg = ((230, 222, 196), (200, 190, 160)); s.shadow = (150, 140, 110)
+    s.floor((218, 204, 172), (206, 192, 160))
+    s.back_wall((228, 218, 192)); s.side_walls((236, 226, 200))
+    rng = random.Random(4)
+    for side in (-1, 1):
+        for z in np.arange(-8.0, 9.0, 1.75):
+            col = (45, 82, 205) if rng.random() < 0.5 else (38, 70, 188)
+            x = side * 7.4
+            s.block((x, 3.6, z + 0.87), (1.2, 7.0, 1.7), col)
+            fx = side * 6.78
+            s.block((fx, 6.1, z + 0.87), (0.06, 0.12, 0.8), (20, 30, 90))
+            s.block((fx, 5.6, z + 0.87), (0.06, 0.12, 0.8), (20, 30, 90))
+            s.block((fx, 3.4, z + 1.3), (0.08, 0.6, 0.14), (205, 210, 225))
+    s.back_rect(-2.2, 2.2, 0, 6.8, (125, 85, 55))
+    s.back_rect(-2.0, -0.1, 0.2, 6.5, (140, 98, 64))
+    s.back_rect(0.1, 2.0, 0.2, 6.5, (140, 98, 64))
+    s.back_rect(-1.2, 1.2, 7.4, 8.4, (40, 180, 95))
+    s.back_rect(-6.2, -3.2, 3.2, 6.8, (200, 160, 100))
+    for i, c in enumerate(((250, 240, 120), (240, 130, 150), (130, 200, 240), (250, 250, 250))):
+        s.back_rect(-6.0 + (i % 2) * 1.4, -5.0 + (i % 2) * 1.4, 3.6 + (i // 2) * 1.5,
+                    4.8 + (i // 2) * 1.5, c, z=8.95)
+    s.finalize(); return s
+
+
+def scene_office():
+    s = Scene("office")
+    s.bg = ((40, 60, 105), (60, 80, 120)); s.shadow = (70, 45, 35)
+    s.floor((124, 84, 58), (112, 74, 50))
+    s.back_wall((46, 72, 118)); s.side_walls((40, 63, 106))
+    s.back_rect(-5.4, -1.4, 4.0, 8.6, (235, 235, 240))
+    s.back_rect(-5.1, -1.7, 4.3, 8.3, (150, 205, 240))
+    s.back_rect(-3.5, -3.3, 4.3, 8.3, (235, 235, 240))
+    s.back_rect(-5.1, -1.7, 6.2, 6.4, (235, 235, 240))
+    s.back_rect(2.2, 5.0, 4.6, 7.8, (95, 70, 45))
+    s.back_rect(2.4, 4.8, 4.8, 7.6, (225, 190, 120))
+    s.quad([(-4.5, 0.02, -2), (4.5, 0.02, -2), (4.5, 0.02, 6.4), (-4.5, 0.02, 6.4)], (170, 42, 52))
+    s.block((0, 3.0, 7.4), (6.4, 0.35, 2.6), (140, 92, 55))
+    s.block((0, 1.55, 6.3), (6.2, 2.9, 0.3), (112, 70, 42))
+    for x in (-3.0, 3.0):
+        s.block((x, 1.55, 7.4), (0.3, 2.9, 2.4), (112, 70, 42))
+    s.block((-1.6, 4.0, 7.7), (1.8, 1.3, 0.15), (30, 32, 40))
+    s.block((-1.6, 4.0, 7.62), (1.6, 1.1, 0.05), (90, 185, 240), flat=True)
+    s.block((-1.6, 3.35, 7.7), (0.4, 0.4, 0.3), (60, 60, 70))
+    s.block((1.4, 3.3, 7.2), (1.2, 0.25, 0.7), (55, 55, 62))
+    rng = random.Random(11)
+    for row in range(3):
+        s.block((7.3, 1.2 + row * 2.2, 4.5), (1.0, 0.18, 6.0), (95, 64, 40))
+        for k in range(10):
+            col = rng.choice([(200, 60, 60), (70, 130, 210), (230, 190, 60), (70, 170, 110), (220, 220, 225)])
+            s.block((7.35, 1.6 + row * 2.2, 1.9 + k * 0.55), (0.7, 0.9, 0.4), col)
+    s.block((-6.5, 0.5, 6.8), (1.1, 1.0, 1.1), (150, 90, 60))
+    s.block((-6.5, 1.9, 6.8), (1.8, 1.9, 1.8), (60, 150, 80))
+    s.block((-6.8, 1.6, 3.4), (1.4, 3.2, 1.4), (150, 156, 168))
+    s.sit_z = 8.4
+    s.finalize(); return s
+
+
+def scene_classroom():
+    s = Scene("classroom")
+    s.bg = ((235, 228, 180), (210, 200, 150)); s.shadow = (120, 90, 60)
+    s.floor((190, 150, 100), (180, 140, 92))
+    s.back_wall((238, 228, 172)); s.side_walls((228, 218, 162))
+    s.back_rect(-5.8, 5.8, 3.0, 8.6, (112, 76, 46))
+    s.back_rect(-5.5, 5.5, 3.3, 8.3, (44, 92, 76))
+    for i, y in enumerate((7.3, 6.5, 5.7)):
+        s.back_rect(-4.5, -1.5 - i, y, y + 0.12, (235, 235, 235), z=8.94)
+    s.back_rect(1.0, 4.2, 6.0, 6.12, (235, 235, 235), z=8.94)
+    s.block((0, 3.0, 8.75), (11.4, 0.2, 0.5), (112, 76, 46))
+    for z0 in (1.0, 4.4):
+        s.side_rect(1, z0, z0 + 2.8, 4.2, 8.6, (232, 232, 238))
+        s.side_rect(1, z0 + 0.2, z0 + 2.6, 4.4, 8.4, (165, 215, 242))
+    for x in (-5.4, 5.4):
+        for z in (3.0, 6.2):
+            s.block((x, 2.3, z), (2.4, 0.22, 1.6), (205, 165, 105))
+            for dx in (-1, 1):
+                for dz in (-1, 1):
+                    s.block((x + dx * 1.0, 1.1, z + dz * 0.6), (0.14, 2.2, 0.14), (90, 90, 100))
+    s.block((0, 2.8, 7.6), (4.4, 0.3, 1.8), (150, 100, 60))
+    s.block((0, 1.4, 6.8), (4.2, 2.6, 0.2), (125, 82, 48))
+    s.block((1.4, 3.15, 7.6), (0.5, 0.5, 0.5), (220, 40, 40))
+    s.sit_z = 8.4
+    s.finalize(); return s
+
+
+def scene_kitchen():
+    s = Scene("kitchen")
+    s.bg = ((245, 228, 185), (225, 205, 160)); s.shadow = (130, 120, 105)
+    s.floor((238, 238, 240), (205, 210, 216))
+    s.back_wall((242, 222, 172)); s.side_walls((248, 230, 182))
+    s.block((0.5, 1.6, 8.0), (13, 3.2, 2.0), (205, 160, 110))
+    s.block((0.5, 3.3, 8.0), (13.2, 0.25, 2.2), (238, 238, 244))
+    for x in np.arange(-5.5, 6.5, 2.4):
+        s.block((x + 0.2, 1.7, 6.97), (2.2, 2.6, 0.06), (190, 144, 96))
+        s.block((x + 0.9, 1.9, 6.93), (0.1, 0.5, 0.06), (230, 230, 235))
+    s.back_rect(-2.2, 2.2, 5.0, 8.8, (235, 235, 240))
+    s.back_rect(-1.9, 1.9, 5.3, 8.5, (150, 205, 242))
+    s.back_rect(-0.05, 0.05, 5.3, 8.5, (235, 235, 240))
+    for x in (-5.5, 5.5):
+        s.block((x, 7.0, 8.4), (3.6, 2.4, 1.2), (205, 160, 110))
+    s.block((-6.7, 3.5, 6.2), (2.4, 7.0, 2.6), (214, 218, 226))
+    s.block((-5.45, 4.2, 4.85), (0.12, 2.2, 0.15), (120, 125, 135))
+    s.block((-5.45, 2.0, 4.85), (0.12, 1.2, 0.15), (120, 125, 135))
+    s.block((4.8, 1.8, 7.9), (3.0, 3.5, 1.9), (70, 74, 86))
+    for dx in (-0.7, 0.7):
+        for dz in (-0.4, 0.4):
+            s.block((4.8 + dx, 3.6, 7.9 + dz), (0.8, 0.1, 0.8), (25, 25, 30))
+    s.block((6.2, 2.6, 2.0), (3.0, 0.25, 3.0), (160, 110, 70))
+    for dx in (-1.2, 1.2):
+        for dz in (-1.2, 1.2):
+            s.block((6.2 + dx, 1.3, 2.0 + dz), (0.2, 2.6, 0.2), (130, 88, 55))
+    s.block((6.2, 2.85, 2.0), (1.1, 0.3, 1.1), (240, 220, 120))
+    s.finalize(); return s
+
+
+def scene_street():
+    s = Scene("street")
+    s.bg = ((120, 185, 240), (208, 232, 250)); s.shadow = (130, 130, 140)
+    s.floor((205, 205, 210), (192, 192, 198), tile=4, x0=-28, x1=28, z0=-28, z1=5)
+    s.quad([(-28, 0.01, 5), (28, 0.01, 5), (28, 0.01, 14), (-28, 0.01, 14)], (72, 74, 84))
+    for x in np.arange(-28, 28, 5):
+        s.quad([(x, 0.02, 9.8), (x + 2.5, 0.02, 9.8), (x + 2.5, 0.02, 10.2), (x, 0.02, 10.2)], (240, 240, 245))
+    s.quad([(-28, 0.01, 14), (28, 0.01, 14), (28, 0.01, 17), (-28, 0.01, 17)], (198, 198, 204))
+    rng = random.Random(21)
+    x = -26
+    while x < 26:
+        w = rng.uniform(4.5, 7.0); h = rng.uniform(9, 20)
+        col = rng.choice([(190, 120, 100), (120, 140, 190), (210, 185, 130), (150, 175, 150), (170, 130, 170)])
+        s.block((x + w / 2, h / 2, 21), (w, h, 4), col)
+        for wx in np.arange(x + 0.9, x + w - 0.6, 1.5):
+            for wy in np.arange(2.6, h - 1, 2.6):
+                wc = (255, 232, 150) if rng.random() < 0.4 else (110, 150, 195)
+                s.quad([(wx, wy, 18.97), (wx + 0.9, wy, 18.97), (wx + 0.9, wy + 1.4, 18.97), (wx, wy + 1.4, 18.97)], wc)
+        x += w + 0.4
+    for tx in (-9, 8.5, -16, 17):
+        s.block((tx, 1.6, 15.6), (0.7, 3.2, 0.7), (110, 75, 50))
+        s.block((tx, 4.4, 15.6), (3.2, 2.8, 3.2), (70, 160, 85))
+    for lx in (-6.5, 6.5):
+        s.block((lx, 3.5, 14.8), (0.3, 7.0, 0.3), (60, 62, 72))
+        s.block((lx, 7.2, 14.4), (0.3, 0.3, 1.4), (60, 62, 72))
+        s.block((lx, 7.0, 13.8), (0.6, 0.3, 0.6), (255, 240, 170), flat=True)
+
+    def car(t):
+        cx = -22 + ((t * 7.0) % 44)
+        z = 11.8
+        col = (215, 50, 60)
+        out = [box((cx, 1.0, z), (4.4, 1.2, 2.1), col),
+               box((cx - 0.2, 2.1, z), (2.4, 1.0, 1.9), (170, 215, 240))]
+        for dx in (-1.4, 1.4):
+            for dz in (-1.0, 1.0):
+                out.append(box((cx + dx, 0.45, z + dz), (0.9, 0.9, 0.35), (30, 30, 38)))
+        return out
+    s.dynamic = car
+    s.finalize(); return s
+
+
+def scene_park():
+    s = Scene("park")
+    s.bg = ((125, 195, 245), (210, 235, 250)); s.shadow = (70, 120, 70)
+    s.floor((112, 188, 96), (100, 176, 88), tile=4, x0=-30, x1=30, z0=-28, z1=36)
+    s.quad([(-30, 0.02, 5.5), (30, 0.02, 5.5), (30, 0.02, 8.5), (-30, 0.02, 8.5)], (205, 180, 125))
+    rng = random.Random(8)
+    for hx, hh in ((-14, 7), (0, 9), (15, 6.5)):
+        s.block((hx, hh / 2, 34), (16, hh, 6), (88, 160, 92))
+    s.block((-16, 18, 42), (5, 5, 1), (255, 235, 110), flat=True)
+    for tx, tz in ((-9, 13), (7.5, 15), (-4, 20), (12, 22), (-14, 24)):
+        s.block((tx, 2.2, tz), (1.0, 4.4, 1.0), (110, 75, 50))
+        s.block((tx, 5.8, tz), (4.6, 3.2, 4.6), (62, 150, 80))
+        s.block((tx, 8.0, tz), (3.2, 2.0, 3.2), (72, 165, 90))
+    for x in np.arange(-14, 15, 2.0):
+        s.block((x, 0.9, 12), (0.3, 1.8, 0.3), (225, 225, 230))
+    s.block((0, 1.3, 12), (30, 0.2, 0.2), (225, 225, 230))
+    s.block((0, 0.7, 12), (30, 0.2, 0.2), (225, 225, 230))
+    s.block((-6.5, 1.3, 4.2), (3.4, 0.25, 1.1), (150, 100, 60))
+    s.block((-6.5, 2.1, 4.75), (3.4, 1.0, 0.2), (150, 100, 60))
+    for dx in (-1.4, 1.4):
+        s.block((-6.5 + dx, 0.6, 4.2), (0.2, 1.2, 0.8), (70, 70, 80))
+    for _ in range(26):
+        fx, fz = rng.uniform(-14, 14), rng.uniform(9, 11)
+        s.block((fx, 0.25, fz), (0.35, 0.5, 0.35),
+                rng.choice([(250, 100, 130), (250, 220, 80), (255, 255, 255), (170, 120, 240)]))
+    s.finalize(); return s
+
+
+def scene_security_room():
+    s = Scene("security_room")
+    s.bg = ((28, 36, 56), (40, 50, 74)); s.shadow = (28, 32, 44)
+    s.floor((52, 58, 74), (44, 49, 64))
+    s.back_wall((32, 42, 64)); s.side_walls((26, 34, 54))
+    rng = random.Random(3)
+    for row, y in enumerate((7.3, 4.6)):
+        for x in (-4.4, 0, 4.4):
+            s.block((x, y, 8.6), (3.6, 2.5, 0.3), (18, 20, 28))
+            s.block((x, y, 8.42), (3.3, 2.2, 0.05), (22, 82, 64), flat=True)
+            for _ in range(2):
+                s.block((x + rng.uniform(-1.1, 1.1), y + rng.uniform(-0.6, 0.6), 8.38),
+                        (0.35, 0.4, 0.04), (255, 205, 70), flat=True)
+    s.block((0, 2.3, 6.4), (10.5, 0.4, 2.5), (66, 72, 94))
+    s.block((0, 1.1, 5.3), (10.5, 2.2, 0.3), (50, 55, 74))
+    for i, c in enumerate(((235, 60, 60), (80, 220, 120), (250, 210, 70), (90, 160, 250), (235, 60, 60))):
+        s.block((-3 + i * 1.5, 2.55, 6.0), (0.55, 0.15, 0.4), c, flat=True)
+    s.block((-6.8, 1.2, 3), (1.6, 2.4, 1.6), (60, 66, 84))
+    s.sit_z = 7.6
+    s.finalize(); return s
+
+
+def scene_store():
+    s = Scene("store")
+    s.bg = ((236, 240, 246), (220, 226, 236)); s.shadow = (150, 156, 170)
+    s.floor((238, 238, 242), (216, 221, 230))
+    s.back_wall((236, 241, 247)); s.side_walls((230, 236, 243))
+    s.block((0, 3.2, 8.2), (15, 6.4, 1.6), (176, 214, 238))
+    rng = random.Random(6)
+    for x in np.arange(-6.4, 7, 2.1):
+        s.back_rect(x - 0.9, x + 0.9, 0.6, 6.0, (205, 235, 250), z=7.38)
+        for y in (1.4, 2.9, 4.4, 5.4):
+            s.back_rect(x - 0.7 + rng.uniform(0, 0.2), x + 0.7, y, y + 0.7,
+                        rng.choice([(230, 70, 70), (250, 200, 60), (70, 160, 230), (90, 200, 120)]), z=7.36)
+    s.back_rect(-3, 3, 8.6, 10.2, (225, 40, 55), z=8.96)
+    s.back_rect(-2.7, 2.7, 8.9, 9.9, (250, 250, 250), z=8.95)
+    for side in (-1, 1):
+        x = side * 6.9
+        s.block((x, 2.8, 3.8), (1.4, 5.6, 9.0), (200, 202, 214))
+        fx = x - side * 0.8
+        for row in range(4):
+            s.block((fx + side * 0.05, 0.9 + row * 1.3, 3.8), (0.15, 0.12, 8.6), (160, 162, 176))
+            for k in range(9):
+                s.block((fx - side * 0.15, 1.3 + row * 1.3, -0.2 + k * 0.95), (0.5, 0.7, 0.55),
+                        rng.choice([(235, 70, 70), (250, 200, 60), (70, 160, 230), (90, 200, 120),
+                                    (240, 130, 40), (170, 100, 220)]))
+    s.block((-3.0, 1.5, 6.0), (3.0, 3.0, 2.2), (120, 130, 150))
+    s.block((-3.0, 3.2, 6.0), (1.0, 0.8, 0.9), (50, 55, 66))
+    s.finalize(); return s
+
+
+SCENE_BUILDERS = {
+    "bathroom": scene_bathroom, "hallway": scene_hallway, "office": scene_office,
+    "classroom": scene_classroom, "kitchen": scene_kitchen, "street": scene_street,
+    "park": scene_park, "security_room": scene_security_room, "store": scene_store,
+}
+_SCENE_CACHE = {}
+
+
+def get_scene(name):
+    if name not in SCENE_BUILDERS:
+        name = "hallway"
+    if name not in _SCENE_CACHE:
+        sc = SCENE_BUILDERS[name]()
+        if not hasattr(sc, "sit_z"):
+            sc.sit_z = None
+        _SCENE_CACHE[name] = sc
+    return _SCENE_CACHE[name]
+
+
+# ---------------------------------------------------------------------
+# SHOT COMPOSITION (cast placement + camera)
+# ---------------------------------------------------------------------
+
+SLOTS = {1: [0.0], 2: [-2.3, 2.3], 3: [-3.5, 0.0, 3.5]}
+SHOT_DIST = {"close": 21.0, "medium": 26.0, "wide": 31.0}
+
+
+def compose_frame(scene, beat, bi, t, u):
+    """Boxes + camera for one frame of a beat. t = secs into beat, u = 0..1."""
+    cast = beat["cast"]
+    people = [c for c in cast if c["who"] != "pigeon"][:3]
+    has_pigeon = any(c["who"] == "pigeon" for c in cast)
+    xs = SLOTS.get(len(people), [0.0])
+    az = [0.0, 0.32, -0.32, 0.18, -0.2, 0.28][bi % 6]
+    boxes, decals = [], []
+    used_x = []
+
+    for c, x in zip(people, xs):
+        pose, emo = c["pose"], c["emotion"]
+        z = 3.2
+        if pose == "sit":
+            z = scene.sit_z if scene.sit_z else 3.2
+            if scene.sit_z is None:
+                z = 3.4
+        yaw = math.pi + az * 0.7 + (0.22 if x < 0 else -0.22 if x > 0 else 0.0)
+        bx, origin = build_character(c["who"], x, z, yaw, pose, emo, t, u)
+        boxes += bx
+        decals.append(shadow_decal(origin, 1.5 * ROSTER[c["who"]]["scale"], scene.shadow))
+        used_x.append(x)
+        if pose == "sit":
+            sx, sz = origin[0], origin[2]
+            sc_ = ROSTER[c["who"]]["scale"]
+            boxes.append(box((sx, 0.8 * sc_, sz - 0.1), (2.2, 0.3, 1.9), (70, 60, 90)))
+            for dx in (-0.9, 0.9):
+                for dz in (-0.8, 0.8):
+                    boxes.append(box((sx + dx, 0.35, sz - 0.1 + dz), (0.18, 0.7, 0.18), (50, 50, 60)))
+            boxes.append(box((sx, 2.0, sz - 1.0), (2.2, 2.4, 0.25), (70, 60, 90)))
+
+    if has_pigeon:
+        px = 4.6 if all(abs(x - 4.6) > 2 for x in used_x) else -4.6
+        bx, origin = build_pigeon(px, 1.2, t, math.pi + az * 0.5 - (0.3 if px > 0 else -0.3))
+        boxes += bx
+        decals.append(shadow_decal(origin, 1.1, scene.shadow))
+        used_x.append(px)
+
+    if scene.dynamic:
+        boxes += scene.dynamic(beat["_t0"] + t)
+
+    maxx = max([abs(x) for x in used_x] + [0.0])
+    d = max(SHOT_DIST.get(beat["shot"], 26.0), (maxx + 2.6) / 0.233)
+    d *= 1.0 - 0.1 * ease(u)                       # slow push-in
+    tx = (sum(used_x) / len(used_x)) * 0.5 if used_x else 0.0
+    target = np.array([tx, 3.6, 3.4])
+    ang = az + math.sin(bi * 1.3 + t * 0.35) * 0.04
+    pos = target + np.array([math.sin(ang) * d, d * 0.21, -math.cos(ang) * d])
+    if beat["fx"] == "shake" and t < 0.55:
+        k = (1 - t / 0.55) * 0.35
+        pos = pos + np.array([math.sin(t * 90) * k, math.cos(t * 77) * k, 0])
+    return Camera(pos, target), {"boxes": boxes, "decals": decals}
+
+
+# ---------------------------------------------------------------------
+# STORY (validation + generation)
+# ---------------------------------------------------------------------
+
+def _b(text, scene, shot, cast, chip=None, trouble=None, hl=(), fx="none"):
+    return {
+        "text": text, "scene": scene, "shot": shot,
+        "cast": [{"who": w, "pose": p, "emotion": e} for w, p, e in cast],
+        "chip": {"text": chip[0], "color": chip[1]} if chip else None,
+        "trouble": trouble, "hl": list(hl), "fx": fx,
+    }
+
+
+DEMO_STORY = {
+    "title": "The Fake Sick Day",
+    "description": "Jake fakes a sick day and learns the internet never forgets.",
+    "summary": "Jake calls in sick, posts his day at the park, and gets caught.",
+    "topic": "fake sick day at work",
+    "tags": ["shorts", "storytime", "funny", "lifelessons"],
+    "beats": [
+        _b("Jake called in sick, then posted his whole day at the park.", "office", "medium",
+           [("boss", "point", "angry"), ("hero", "shock", "scared")],
+           ("JAKE GOT CAUGHT", "red"), "big", ["sick", "park"], "shake"),
+        _b("It started with a fake cough and a very convincing voice.", "kitchen", "medium",
+           [("hero", "shrug", "smug")], None, None, ["fake", "cough"]),
+        _b("His boss said feel better, and Jake felt amazing.", "kitchen", "medium",
+           [("hero", "celebrate", "happy")], None, None, ["amazing"]),
+        _b("At the park, he took a hundred selfies and posted every single one.", "park", "wide",
+           [("hero", "celebrate", "happy"), ("friend", "idle", "happy")],
+           ("SOCIAL MEDIA IS PUBLIC*", "purple"), None, ["selfies", "posted"]),
+        _b("A coworker named Dana saw the posts and showed the entire office.", "store", "wide",
+           [("friend", "point", "smug"), ("kid", "shock", "shock")],
+           ("COWORKERS TALK", "purple"), None, ["Dana", "entire", "office"]),
+        _b("Back at work, his boss was holding a printed selfie.", "office", "medium",
+           [("boss", "sit", "angry"), ("hero", "panic", "scared")], None, "big", ["printed", "selfie"], "shake"),
+        _b("Faking a sick day can count as lying to your employer.", "office", "medium",
+           [("boss", "point", "angry"), ("hero", "cry", "sad")],
+           ("FAKING SICK = LYING*", "red"), None, ["lying", "employer"]),
+        _b("And many companies can check what you post in public.", "security_room", "medium",
+           [("cop", "sit", "neutral"), ("hero", "shock", "scared")],
+           ("PUBLIC POSTS = EVIDENCE*", "purple"), None, ["check", "public"]),
+        _b("Possible results are a warning, lost pay, or even getting fired.", "office", "medium",
+           [("boss", "sit", "angry"), ("hero", "cry", "sad")],
+           ("CAN LOSE YOUR JOB*", "red"), "some", ["warning", "fired"]),
+        _b("But here's the twist: Jake actually had real sick days saved.", "hallway", "medium",
+           [("hero", "shrug", "sad"), ("friend", "shrug", "neutral")],
+           ("ASK FOR TIME OFF*", "blue"), None, ["twist", "real"]),
+        _b("If he had just asked, his boss probably would have said yes.", "office", "medium",
+           [("boss", "sit", "happy"), ("hero", "shrug", "sad")],
+           None, "none", ["just asked", "yes"]),
+        _b("Instead, he got a warning and a very awkward group chat.", "hallway", "wide",
+           [("hero", "cry", "sad"), ("friend", "idle", "smug"), ("kid", "idle", "smug")],
+           None, None, ["warning", "awkward"]),
+        _b("Now Jake works Saturdays, and the pigeon knows everything.", "park", "wide",
+           [("hero", "idle", "sad"), ("pigeon", "idle", "neutral")], None, None, ["Saturdays", "pigeon"]),
+        _b("Would you call in sick for a day at the park? Tell me below.", "park", "medium",
+           [("hero", "celebrate", "happy"), ("pigeon", "idle", "neutral")], None, None, ["Tell me below"]),
+    ],
+}
+
+
+def clean_beat(beat):
     if not isinstance(beat, dict):
         raise ValueError("A story beat was not an object.")
 
-    kind = "huss" if str(beat.get("kind", "line")).lower() == "huss" else "line"
     text = re.sub(r"\s+", " ", str(beat.get("text", ""))).strip()
-    if kind == "huss" and not text:
-        text = "Huss, huss, huss."
-    if not text:
+    if len(text.split()) < 3:
         raise ValueError("A story beat has no narration.")
 
-    scene = beat.get("scene", "city_night")
-    if scene not in SCENES:
-        scene = "city_night"
+    scene = beat.get("scene", "hallway")
+    scene = scene if scene in SCENES else "hallway"
+    shot = beat.get("shot", "medium")
+    shot = shot if shot in SHOTS else "medium"
+    fx = "shake" if beat.get("fx") in ("shake", "shock", "explosion") else "none"
 
-    activity = beat.get("activity", default_activity)
-    if activity not in ACTIVITIES:
-        activity = default_activity
+    cast = []
+    for item in (beat.get("cast") or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        who = item.get("who", "hero")
+        who = who if who in WHO else "hero"
+        if any(c["who"] == who for c in cast):
+            continue
+        pose = item.get("pose", "idle")
+        pose = pose if pose in POSES else "idle"
+        emo = item.get("emotion", "neutral")
+        emo = emo if emo in EMOTIONS else "neutral"
+        cast.append({"who": who, "pose": pose, "emotion": emo})
+    if not [c for c in cast if c["who"] != "pigeon"]:
+        cast.insert(0, {"who": "hero", "pose": "idle", "emotion": "neutral"})
+    # at most 3 people (the pigeon is extra)
+    people = [c for c in cast if c["who"] != "pigeon"][:3]
+    cast = people + [c for c in cast if c["who"] == "pigeon"][:1]
+    if scene not in ("office", "classroom", "security_room"):
+        for c in cast:
+            if c["pose"] == "sit":
+                c["pose"] = "idle"
 
-    emotion = beat.get("emotion", "neutral")
-    if emotion not in EMOTIONS:
-        emotion = "neutral"
+    chip = None
+    raw = beat.get("chip")
+    if isinstance(raw, dict) and str(raw.get("text", "")).strip():
+        color = raw.get("color", "purple")
+        chip = {
+            "text": re.sub(r"\s+", " ", str(raw["text"])).strip().upper()[:30],
+            "color": color if color in CHIP_COLORS else "purple",
+        }
 
-    fx = beat.get("fx", "none")
-    if fx not in EFFECTS:
-        fx = "none"
+    trouble = beat.get("trouble")
+    trouble = trouble if trouble in TROUBLE else None
 
-    chars = [{
-        "who": "kevin",
-        "emotion": emotion,
-        "action": "huss" if kind == "huss" else "idle",
-    }]
-    if beat.get("pigeon"):
-        chars.append({"who": "pigeon", "emotion": "neutral", "action": "idle"})
+    hl = beat.get("hl") or []
+    hl = [str(x) for x in hl][:6] if isinstance(hl, list) else []
 
     return {
-        "label": str(beat.get("label", "STORY"))[:24],
-        "kind": kind,
-        "text": text,
-        "scene": scene,
-        "chars": chars,
-        "activity": activity,
-        "party": bool(beat.get("party", True)),
-        "fx": fx,
-        "visual": str(beat.get("visual", ""))[:80],
+        "text": text, "scene": scene, "shot": shot, "cast": cast,
+        "chip": chip, "trouble": trouble, "hl": hl, "fx": fx,
     }
 
 
 def write_episode(episode_number, state):
+    if CFG["demo"]:
+        data = json.loads(json.dumps(DEMO_STORY))
+        data["beats"] = [clean_beat(b) for b in data["beats"]]
+        return data
+
     trends = trending_topics()
     recent = state.get("topics", [])[-40:]
     twist = random.choice(trends) if trends else "an everyday problem"
-    activity = random.choice(sorted(ACTIVITIES))
+    area = random.choice([
+        "school", "a job", "driving and traffic", "shopping", "social media",
+        "neighbors", "airports and travel", "restaurants", "sports", "online gaming",
+        "borrowing things", "public transport", "a group chat", "a family trip",
+    ])
 
     prompt = f"""
-You write viral vertical YouTube Shorts in the "Huss Huss Huss" meme format:
-a deadpan blocky Roblox-style avatar calmly tells the story of a town where
-everybody goes out partying except him. Between his lines he is shown doing
-one repetitive skill and making a heavy-breathing sound: "Huss, huss, huss."
+You write viral 40-55 second vertical YouTube Shorts in the "DUMB MOVES" style:
+a narrator tells a funny, relatable story about someone's dumb decision and
+what could realistically happen next, while blocky characters act it out.
 
-FORMAT RULES
-- One narrator avatar, flat deadpan delivery, quietly sad-funny.
-- Beats are either kind "line" (a spoken sentence) or kind "huss" (the avatar
-  does his skill and the narration is ONLY a breathing sound such as
-  "Huss, huss, huss." or "Huss, huss, huss, huss.").
-- Pattern: HOOK line, line, huss, line, line, huss, line, bigger escalation,
-  huss, a twist or payoff, then a final short line or huss that loops back to
-  the hook. Use at least 3 huss beats.
-- The hook is the signature setup, reworded for this episode, for example:
-  "In this town, everybody goes out partying except me."
-- This episode's skill (activity): {activity}. Lines must make sense for it.
-- Every line escalates the absurdity: why he trains, what he gave up, how good
-  he is getting, what the town thinks. Lines are 6 to 14 words.
-- A silent pigeon watches from the side in 2 to 3 beats (set "pigeon": true).
-- Optional comedic twist inspiration (use loosely; no real people or brands):
-  {twist}
-- Avoid repeating these topics: {json.dumps(recent[-25:])}
-- Family friendly. Original wording. No copyrighted characters, lyrics, brands
-  or real people's names.
+STRUCTURE (14 to 17 beats)
+1. HOOK beat: states the dumb move and that the hero got caught/in trouble.
+2. Beats that show how it started, then how it escalated.
+3. Several beats that explain the real-world consequences ("In many places...",
+   "Possible results are...", "It can count as..."). Each consequence gets a
+   "chip" (a short tag, 2-4 words, UPPERCASE) that stacks on screen. Add a
+   trailing * to chips that state a general rule.
+4. A TWIST beat ("But here's the twist...") that shows what he should have done.
+5. A funny last beat that ends with a question for the comments.
+Topic area for this episode: {area}
+Loose trend inspiration (optional): {twist}
+Do NOT repeat these topics: {json.dumps(recent[-30:])}
 
-Return ONLY valid JSON in this exact shape:
+RULES
+- The hero has a first name. Spoken lines are 7 to 14 words, punchy, funny,
+  in plain spoken English (it will be read aloud by a voice).
+- Total spoken words: 95 to 150.
+- Be accurate and hedged: say "can", "may", "often", "in many places". Never
+  give medical or legal advice and never claim a specific law or penalty.
+- Family friendly. No real people, brands, or copyrighted characters.
+- Vary scenes, shots, poses and who is on screen. Use "sit" only in office,
+  classroom or security_room. A silent pigeon may appear in 2-3 beats.
+- "hl" lists 1-3 important words or short phrases from that beat's text.
+- "trouble" is big, some, or none. Start with big, move to some around the
+  twist, and end with none (or some). Only set it when it changes.
+
+Return ONLY valid JSON in exactly this shape:
 {{
- "title":"short clickable title, under 70 chars",
- "description":"one sentence",
- "summary":"one sentence plot summary",
- "topic":"short topic label for this episode",
- "activity":"{activity}",
- "tags":["huss","shorts","funny"],
- "beats":[
+ "title": "SHORT TITLE LIKE THE FAKE SICK DAY",
+ "description": "one sentence",
+ "summary": "one sentence plot summary",
+ "topic": "short topic label",
+ "tags": ["shorts","storytime","funny"],
+ "beats": [
   {{
-   "label":"HOOK",
-   "kind":"line",
-   "text":"In this town, everybody goes out partying except me.",
-   "scene":"city_night",
-   "party":true,
-   "emotion":"sad",
-   "activity":"{activity}",
-   "pigeon":false,
-   "fx":"none",
-   "visual":"short visible action"
+   "text": "Jake called in sick, then posted his whole day at the park.",
+   "scene": "office",
+   "shot": "medium",
+   "cast": [{{"who":"boss","pose":"point","emotion":"angry"}},
+            {{"who":"hero","pose":"shock","emotion":"scared"}}],
+   "chip": {{"text":"JAKE GOT CAUGHT","color":"red"}},
+   "trouble": "big",
+   "hl": ["sick","park"],
+   "fx": "shake"
   }}
  ]
 }}
-
-Make 10 to 14 beats and 35 to 110 spoken words in total.
 Use only these values:
-Scenes: {sorted(SCENES)}
-Emotions: {sorted(EMOTIONS)}
-Activities: {sorted(ACTIVITIES)}
-Effects: {sorted(EFFECTS)}
+scene: {SCENES}
+shot: {SHOTS}
+who: {WHO}  (hero = the main character)
+pose: {POSES}
+emotion: {EMOTIONS}
+chip color: {sorted(CHIP_COLORS)}
+fx: none or shake
 """
 
     last_error = None
-
     for attempt in range(4):
         try:
             data = llm_json(prompt)
-            default_activity = data.get("activity")
-            if default_activity not in ACTIVITIES:
-                default_activity = activity
-
-            beats = [clean_beat(x, default_activity) for x in data.get("beats", [])]
+            beats = [clean_beat(x) for x in data.get("beats", [])]
             words = sum(len(x["text"].split()) for x in beats)
-            huss_count = sum(1 for x in beats if x["kind"] == "huss")
+            chips = sum(1 for x in beats if x["chip"])
 
-            if not 8 <= len(beats) <= 16 or not 30 <= words <= 140:
-                raise ValueError(
-                    f"Story length outside limits: {len(beats)} beats, {words} words"
-                )
-            if huss_count < 2:
-                raise ValueError("Story needs at least 2 huss beats.")
+            if not 10 <= len(beats) <= 20 or not 70 <= words <= 190:
+                raise ValueError(f"Story length outside limits: {len(beats)} beats, {words} words")
+            if chips < 3:
+                raise ValueError("Story needs at least 3 consequence chips.")
 
             data["beats"] = beats
-            data["activity"] = default_activity
-            data["title"] = str(
-                data.get("title", f"In This Town #{episode_number}")
-            )[:90]
-            data["topic"] = str(data.get("topic", f"{default_activity} grind"))[:100]
+            data["title"] = str(data.get("title", f"Dumb Moves #{episode_number}"))[:60]
+            data["topic"] = str(data.get("topic", area))[:100]
             data["summary"] = str(data.get("summary", ""))[:300]
             data["description"] = str(data.get("description", ""))[:500]
             data["tags"] = [str(t)[:30] for t in data.get("tags", [])[:12]]
@@ -536,765 +1470,458 @@ Effects: {sorted(EFFECTS)}
 
 
 # ---------------------------------------------------------------------
-# NARRATION
+# NARRATION (natural neural voice, Piper as fallback)
 # ---------------------------------------------------------------------
 
-def init_tts():
-    print("Using Piper for narration.")
+TRIM = (
+    "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-48dB,"
+    "areverse,"
+    "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-48dB,"
+    "areverse,"
+    "highpass=f=70,apad=pad_dur=0.2"
+)
 
 
-def synthesize_piper(text, output_path):
+def synthesize_edge(text, out_path):
+    """Microsoft neural voice through the free edge-tts package."""
+    last = ""
+    for attempt in range(3):
+        out_path.unlink(missing_ok=True)
+        result = subprocess.run(
+            [sys.executable, "-m", "edge_tts",
+             f"--voice={CFG['voice']}", f"--rate={CFG['voice_rate']}",
+             f"--pitch={CFG['voice_pitch']}", f"--text={text}",
+             f"--write-media={out_path}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90,
+        )
+        if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 800:
+            return
+        last = (result.stderr or result.stdout)[-600:]
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError("edge-tts failed: " + last)
+
+
+def synthesize_piper(text, out_path):
     binary = CFG["piper_bin"]
     if not shutil.which(binary) and not Path(binary).exists():
         raise RuntimeError(f"Piper executable not found: {binary}")
-
     model = Path(CFG["piper_model"])
     if not model.exists():
         raise RuntimeError(f"Piper model not found: {model}")
-
-    # Piper's CLI flag spelling differs between releases; try each variant.
-    variants = [
-        ["--length_scale", "0.94"],
-        ["--length-scale", "0.94"],
-        [],
-    ]
-    last_error = ""
-    for extra in variants:
-        output_path.unlink(missing_ok=True)
+    last = ""
+    for extra in (["--length_scale", "0.94"], ["--length-scale", "0.94"], []):
+        out_path.unlink(missing_ok=True)
         result = subprocess.run(
-            [binary, "--model", str(model), *extra,
-             "--output_file", str(output_path)],
-            input=text, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [binary, "--model", str(model), *extra, "--output_file", str(out_path)],
+            input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        if (
-            result.returncode == 0
-            and output_path.exists()
-            and output_path.stat().st_size > 1000
-        ):
+        if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1000:
             return
-        last_error = result.stderr[-1500:]
+        last = result.stderr[-800:]
+    raise RuntimeError("Piper failed: " + last)
 
-    raise RuntimeError("Piper failed: " + last_error)
+
+_TTS_STATE = {"edge_ok": True, "announced": False}
+
+
+def synthesize(text, raw_path):
+    """Write speech for one line to raw_path. Neural voice first."""
+    if _TTS_STATE["edge_ok"]:
+        try:
+            synthesize_edge(text, raw_path)
+            if not _TTS_STATE["announced"]:
+                print("Narration voice:", CFG["voice"])
+                _TTS_STATE["announced"] = True
+            return
+        except Exception as exc:
+            print("Neural voice unavailable, falling back to Piper:", str(exc)[:300])
+            _TTS_STATE["edge_ok"] = False
+    synthesize_piper(text, raw_path)
 
 
 def voice_beats(beats, folder):
-    processed_files = []
-    durations = []
-
+    clips, durations = [], []
     for index, beat in enumerate(beats):
-        raw = folder / f"voice_raw_{index:02d}.wav"
-        synthesize_piper(beat["text"], raw)
-
-        # Huss beats get a minimum length so the animation can actually play.
-        pad = "apad=whole_dur=1.7" if beat["kind"] == "huss" else "apad=pad_dur=0.18"
-
-        processed = folder / f"voice_{index:02d}.wav"
-        run([
-            "ffmpeg", "-y", "-i", str(raw),
-            "-af",
-            "highpass=f=75,lowpass=f=11000,"
-            "acompressor=threshold=-18dB:ratio=2.5:attack=8:release=100,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11," + pad,
-            "-ar", "24000", "-ac", "1", str(processed),
-        ])
-
+        raw = folder / f"voice_raw_{index:02d}.mp3"
+        synthesize(beat["text"], raw)
+        clip = folder / f"voice_{index:02d}.wav"
+        run(["ffmpeg", "-y", "-i", str(raw), "-af", TRIM,
+             "-ar", "24000", "-ac", "1", str(clip)])
         raw.unlink(missing_ok=True)
-        processed_files.append(processed)
-        durations.append(probe_duration(processed))
+        clips.append(clip)
+        durations.append(probe_duration(clip))
 
-    concat_list = folder / "voice_list.txt"
-    concat_list.write_text(
-        "".join(f"file '{p.name}'\n" for p in processed_files), encoding="utf-8"
-    )
-    run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", concat_list.name, "-c:a", "pcm_s16le", "voice.wav",
-    ], cwd=folder)
-
+    concat = folder / "voice_list.txt"
+    concat.write_text("".join(f"file '{p.name}'\n" for p in clips), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat.name,
+         "-c:a", "pcm_s16le", "voice.wav"], cwd=folder)
     return durations
 
 
 # ---------------------------------------------------------------------
-# CAPTIONS
+# TIMELINE (beat times, word times, caption chunks, chips, sound effects)
 # ---------------------------------------------------------------------
 
-def ass_time(seconds):
-    seconds = max(0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = seconds % 60
-    return f"{hours}:{minutes:02d}:{secs:05.2f}"
+_FONTS = {}
 
 
-def fallback_word_times(beats, durations):
-    """Spread each beat's script words across that beat's exact duration."""
-    result = []
-    current = 0.0
-    for beat, duration in zip(beats, durations):
-        words = beat["text"].split()
-        weights = [max(1, len(re.sub(r"\W", "", w))) for w in words]
-        total = sum(weights) or 1
-        # Leave the padded tail silent.
-        speech = max(0.3, duration - (0.18 if beat["kind"] == "line" else 0.2))
-        cursor = current
-        for word, weight in zip(words, weights):
-            span = speech * weight / total
-            result.append((cursor, cursor + span, word))
-            cursor += span
-        current += duration
-    return result
+def font(size):
+    if size in _FONTS:
+        return _FONTS[size]
+    candidates = [
+        ROOT / "fonts" / "Poppins-Bold.ttf",
+        "/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    f = None
+    for c in candidates:
+        if Path(c).exists():
+            f = ImageFont.truetype(str(c), size)
+            break
+    if f is None:
+        try:
+            f = ImageFont.load_default(size)
+        except TypeError:
+            f = ImageFont.load_default()
+    _FONTS[size] = f
+    return f
 
 
-def transcribe_words(audio_path, beats, durations):
-    """Script-accurate captions. Whisper timing only if it matches the script."""
-    script_words = [w for b in beats for w in b["text"].split()]
-    fallback = fallback_word_times(beats, durations)
-
-    if not CFG["use_whisper"]:
-        return fallback
-
-    try:
-        from faster_whisper import WhisperModel
-
-        model = WhisperModel(
-            os.getenv("WHISPER_MODEL", "small"), device="cpu", compute_type="int8"
-        )
-        segments, _ = model.transcribe(
-            str(audio_path), word_timestamps=True, vad_filter=True
-        )
-        heard = []
-        for segment in segments:
-            for item in (segment.words or []):
-                if item.word.strip():
-                    heard.append((float(item.start), float(item.end)))
-
-        if len(heard) == len(script_words):
-            return [(s, e, w) for (s, e), w in zip(heard, script_words)]
-        print("Whisper word count differs from script; using script timing.")
-    except Exception as exc:
-        print("Whisper unavailable; using script timing:", exc)
-
-    return fallback
+def wkey(word):
+    return re.sub(r"[^a-z0-9']", "", word.lower())
 
 
-def write_ass(words, beats, durations, episode_number, path):
-    header = """[Script Info]
-Title: Shorts Factory Captions
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,DejaVu Sans,76,&H00FFFFFF,&H0000FFFF,&H00151520,&H80000000,1,0,0,0,100,100,0,0,1,5,2,2,90,90,300,1
-Style: Top,DejaVu Sans,40,&H00FFFFFF,&H0000FFFF,&H00151520,&H80000000,1,0,0,0,100,100,0,0,1,3,1,8,70,70,100,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    lines = [header]
-    total = sum(durations)
-    series = SERIES_NAME.replace(",", "")
-
-    lines.append(
-        f"Dialogue: 0,0:00:00.00,{ass_time(min(2, total))},"
-        f"Top,,0,0,0,,{series}  •  EPISODE {episode_number}\n"
-    )
-
-    for start, end, word in words:
-        clean = word.replace("{", "").replace("}", "").replace("\\", "")
-        if not clean:
-            continue
-        lines.append(
-            f"Dialogue: 1,{ass_time(start)},{ass_time(max(start + 0.08, end))},"
-            f"Default,,0,0,0,,{clean}\n"
-        )
-
-    path.write_text("".join(lines), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------
-# CARTOON ("toon") VISUALS
-# ---------------------------------------------------------------------
-
-def mix(a, b, t):
-    t = clamp(t, 0, 1)
-    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
-
-
-def ease(t):
-    t = clamp(t, 0, 1)
-    return t * t * (3 - 2 * t)
-
-
-PALETTES = {
-    "classroom": ((100, 185, 225), (238, 220, 170)),
-    "bedroom": ((75, 105, 165), (210, 175, 155)),
-    "kitchen": ((110, 185, 175), (245, 225, 190)),
-    "office": ((90, 125, 165), (205, 215, 220)),
-    "lab": ((80, 160, 190), (205, 235, 225)),
-    "stage": ((70, 55, 110), (230, 120, 95)),
-    "street": ((100, 170, 205), (220, 190, 140)),
-    "city_night": ((25, 35, 75), (90, 80, 130)),
-    "park": ((90, 175, 125), (215, 220, 160)),
-    "space": ((20, 25, 65), (70, 75, 135)),
-}
-
-
-def make_bg(scene):
-    top, bottom = PALETTES.get(scene, PALETTES["city_night"])
-    img = Image.new("RGB", (TW, TH))
-    draw = ImageDraw.Draw(img)
-
-    for y in range(TH):
-        draw.line((0, y, TW, y), fill=mix(top, bottom, y / TH))
-
-    if scene == "space":
-        rng = random.Random(12)
-        for _ in range(90):
-            x, y = rng.randrange(TW), rng.randrange(TH)
-            r = rng.choice((1, 2, 3))
-            draw.ellipse((x - r, y - r, x + r, y + r), fill="white")
-        draw.ellipse((480, 150, 700, 370), fill=(100, 115, 205))
-    else:
-        draw.rectangle((0, 950, TW, TH), fill=(75, 100, 95))
-
-        if scene in {"street", "city_night"}:
-            rng = random.Random(scene)
-            for x in range(0, TW, 90):
-                height = rng.randint(250, 570)
-                draw.rectangle((x, 950 - height, x + 75, 950), fill=(55, 65, 90))
-                for wy in range(1000 - height, 900, 65):
-                    for wx in range(x + 15, x + 65, 28):
-                        draw.rectangle((wx, wy, wx + 10, wy + 18), fill=(255, 220, 120))
+def wrap_words(words, fnt, maxw):
+    lines, cur = [], []
+    space = fnt.getlength(" ") + 16
+    for w in words:
+        trial = cur + [w]
+        width = sum(fnt.getlength(x) for x in trial) + space * (len(trial) - 1)
+        if cur and width > maxw:
+            lines.append(cur)
+            cur = [w]
         else:
-            draw.rectangle((40, 180, TW - 40, 850), fill=(235, 230, 205), outline=INK, width=8)
-            draw.rectangle((75, 220, TW - 75, 800), fill=(180, 220, 230))
-            draw.rectangle((0, 900, TW, 930), fill=(145, 105, 75))
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines
 
+
+def chunk_words(words, fnt, maxw=860, max_words=7):
+    chunks, cur = [], []
+    for w in words:
+        trial = cur + [w]
+        if cur and (len(trial) > max_words or len(wrap_words(trial, fnt, maxw)) > 2):
+            chunks.append(cur)
+            cur = [w]
+        else:
+            cur = trial
+        if re.search(r"[.!?,;:]$", w) and len(cur) >= 3:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def build_timeline(beats, durations):
+    """Fill beats with start times / durations and build HUD timing."""
+    t = 0.0
+    trouble = "big"
+    chips = []
+    sfx = []
+    captions = []          # (start, end, [(word, is_highlight)])
+    fnt = font(72)
+
+    for i, (beat, dur) in enumerate(zip(beats, durations)):
+        beat["_t0"] = t
+        beat["_dur"] = max(1.7, dur) + (0.45 if i == len(beats) - 1 else 0.0)
+        speech = max(0.4, dur - 0.2)
+
+        if beat["trouble"]:
+            trouble = beat["trouble"]
+        beat["_trouble"] = trouble
+
+        if beat["chip"]:
+            ct = t + min(0.5, speech * 0.25)
+            chips.append({"text": beat["chip"]["text"],
+                          "color": CHIP_COLORS[beat["chip"]["color"]], "t0": ct})
+            sfx.append((ct, "pop"))
+        if beat["fx"] == "shake" or any(c["pose"] in ("shock", "fall") for c in beat["cast"]):
+            sfx.append((t + 0.02, "thud"))
+
+        words = beat["text"].split()
+        weights = [max(1, len(re.sub(r"\W", "", w))) + 1 for w in words]
+        total = sum(weights)
+        hl = set()
+        for phrase in beat["hl"]:
+            hl.update(wkey(x) for x in phrase.split())
+        hl.discard("")
+
+        cursor = t
+        timed = []
+        for w, wt in zip(words, weights):
+            span = speech * wt / total
+            timed.append((cursor, cursor + span, w))
+            cursor += span
+
+        idx = 0
+        for chunk in chunk_words(words, fnt):
+            start = timed[idx][0]
+            idx += len(chunk)
+            captions.append([start, None,
+                             [(w, wkey(w) in hl) for w in chunk]])
+        t += beat["_dur"]
+
+    # each caption stays until the next one starts (or the video ends)
+    for k, cap in enumerate(captions):
+        cap[1] = captions[k + 1][0] if k + 1 < len(captions) else t
+    return {"total": t, "chips": chips, "sfx": sfx, "captions": captions}
+
+
+# ---------------------------------------------------------------------
+# HUD (title, trouble bar, stacking chips, captions)
+# ---------------------------------------------------------------------
+
+def stroke_text(draw, xy, text, fnt, fill, stroke=6, anchor="la"):
+    draw.text(xy, text, font=fnt, fill=fill, stroke_width=stroke,
+              stroke_fill=(16, 16, 28), anchor=anchor)
+
+
+def build_title_blocks(title, episode):
+    blocks = {}
+    title = title.upper()
+    for key, (label, colour) in TROUBLE.items():
+        img = Image.new("RGBA", (TW, 330), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        stroke_text(d, (64, 6), f"{SERIES_NAME}  •  EP {episode}", font(30),
+                    (255, 225, 120), 5)
+        size = 78
+        while size > 46 and font(size).getlength(title) > TW - 128:
+            size -= 4
+        lines = [title]
+        if font(size).getlength(title) > TW - 128:
+            words = title.split()
+            half = max(1, len(words) // 2)
+            lines = [" ".join(words[:half]), " ".join(words[half:])]
+            size = 62
+        y = 52
+        for line in lines:
+            stroke_text(d, (64, y), line, font(size), (255, 255, 255), 5)
+            y += int(size * 1.2)
+        by = y + 10
+        d.rounded_rectangle((64, by, 64 + 600, by + 54), radius=27, fill=colour,
+                            outline=(255, 255, 255), width=4)
+        d.text((64 + 300, by + 28), label, font=font(30), fill=(255, 255, 255), anchor="mm")
+        blocks[key] = (img, by + 54)
+    return blocks
+
+
+def build_chip(text, colour):
+    fnt = font(40)
+    w = int(fnt.getlength(text)) + 90
+    img = Image.new("RGBA", (w + 16, 100), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((12, 14, w + 8, 82), radius=34, fill=(0, 0, 0, 110))
+    d.rounded_rectangle((8, 8, w + 4, 74), radius=34, fill=colour,
+                        outline=(255, 255, 255), width=4)
+    d.text((8 + (w - 4) // 2 + 2, 42), text, font=fnt, fill=(255, 255, 255), anchor="mm")
     return img
 
 
-def draw_party(draw, t):
-    """Flashing party lights plus tiny dancing silhouettes in the background."""
-    rng = random.Random(int(t / 0.25) + 5)
-    colors = [(255, 60, 160), (60, 220, 255), (255, 225, 60),
-              (150, 90, 255), (80, 255, 140)]
-    for _ in range(9):
-        x, y = rng.randint(30, TW - 30), rng.randint(220, 520)
-        r = rng.randint(20, 46)
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=rng.choice(colors))
-
-    for i in range(6):
-        x = 50 + i * 125
-        hop = abs(math.sin(t * 6 + i)) * 20
-        base = 940 - hop
-        draw.rounded_rectangle((x - 16, base - 70, x + 16, base), radius=8, fill=(30, 28, 55))
-        draw.ellipse((x - 14, base - 102, x + 14, base - 74), fill=(30, 28, 55))
-
-
-ROSTER = {
-    "kevin": {
-        "shirt": (235, 75, 65),
-        "pants": (45, 65, 105),
-        "hair": (65, 40, 25),
-    },
-}
-
-
-def draw_pigeon(draw, x, y, scale=1.0, beat_t=0.0):
-    y += math.sin(beat_t * 6) * 5 * scale
-    s = scale
-    draw.ellipse((x - 48*s, y - 45*s, x + 48*s, y + 38*s), fill=(115, 125, 140), outline=INK, width=4)
-    draw.ellipse((x + 10*s, y - 78*s, x + 58*s, y - 25*s), fill=(125, 135, 150), outline=INK, width=4)
-    draw.polygon(
-        [(x + 45*s, y - 55*s), (x + 80*s, y - 43*s), (x + 45*s, y - 35*s)],
-        fill=(240, 155, 45), outline=INK,
-    )
-    draw.ellipse((x + 35*s, y - 62*s, x + 43*s, y - 54*s), fill=INK)
-    draw.line((x - 12*s, y + 30*s, x - 15*s, y + 58*s), fill=(220, 145, 45), width=4)
-    draw.line((x + 18*s, y + 30*s, x + 20*s, y + 58*s), fill=(220, 145, 45), width=4)
+def build_caption(words):
+    fnt = font(72)
+    maxw = 880
+    plain = [w for w, _ in words]
+    lines = wrap_words(plain, fnt, maxw)
+    if len(lines) > 2:
+        fnt = font(60)
+        lines = wrap_words(plain, fnt, maxw)
+    line_h = int(fnt.size * 1.3)
+    img = Image.new("RGBA", (TW, line_h * len(lines) + 30), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    hl_map = {i: h for i, (_, h) in enumerate(words)}
+    space = fnt.getlength(" ") + 16
+    n = 0
+    for li, line in enumerate(lines):
+        total = sum(fnt.getlength(x) for x in line) + space * (len(line) - 1)
+        x = (TW - total) / 2
+        y = li * line_h + fnt.size + 6
+        for w in line:
+            colour = (255, 178, 30) if hl_map.get(n) else (255, 255, 255)
+            d.text((x, y), w, font=fnt, fill=colour, stroke_width=9,
+                   stroke_fill=(16, 16, 28), anchor="ls")
+            x += fnt.getlength(w) + space
+            n += 1
+    return img
 
 
-def draw_character(draw, x, ground_y, scale, emotion, action, activity, beat_t):
-    spec = ROSTER["kevin"]
-    s = scale
-    phase = (beat_t % PERIOD) / PERIOD
-    swing = math.sin(math.tau * phase)
-    lift = (1 - math.cos(math.tau * phase)) / 2  # 0..1..0 each repetition
-
-    bob = 0.0
-    ldy = rdy = 0.0  # arm end offsets
-    huss = action == "huss"
-
-    if huss:
-        amp = 60 if activity == "jump_rope" else 22
-        bob = -abs(math.sin(math.pi * phase)) * amp * s
-        if activity == "basketball":
-            rdy = swing * 40
-        elif activity == "weights":
-            ldy = rdy = -lift * 170
-        elif activity == "running":
-            ldy, rdy = swing * 45, -swing * 45
-        elif activity == "typing":
-            ldy, rdy = swing * 10, -swing * 10
-        elif activity == "jump_rope":
-            ldy, rdy = swing * 25, swing * 25
-    elif action in {"jump", "panic"}:
-        bob = -abs(math.sin(beat_t * 8)) * 45 * s
-
-    y = ground_y + bob
-    head_size = 100 * s
-    body_top = y - 250 * s
-    head_top = body_top - head_size + 10 * s
-
-    leg_swing = swing * 18 * s if (huss and activity == "running") else 0
-    draw.line((x - 25*s, y - 75*s, x - 42*s + leg_swing, ground_y), fill=spec["pants"], width=max(1, int(24*s)))
-    draw.line((x + 25*s, y - 75*s, x + 42*s - leg_swing, ground_y), fill=spec["pants"], width=max(1, int(24*s)))
-
-    draw.rounded_rectangle(
-        (x - 58*s, body_top, x + 58*s, y - 65*s),
-        radius=max(1, int(25*s)), fill=spec["shirt"], outline=INK, width=4,
-    )
-
-    draw.line((x - 50*s, body_top + 25*s, x - 95*s, body_top + 100*s + ldy*s), fill=spec["shirt"], width=max(1, int(22*s)))
-    draw.line((x + 50*s, body_top + 25*s, x + 95*s, body_top + 100*s + rdy*s), fill=spec["shirt"], width=max(1, int(22*s)))
-
-    draw.ellipse((x - head_size/2, head_top, x + head_size/2, head_top + head_size),
-                 fill=(245, 190, 145), outline=INK, width=4)
-    draw.pieslice((x - head_size/2 - 3, head_top - 12*s, x + head_size/2 + 3, head_top + 48*s),
-                  180, 360, fill=spec["hair"], outline=INK)
-
-    face_y = head_top + head_size * .56
-    eye_r = (17 if emotion in {"shock", "scared"} else 13) * s
-
-    for side in (-1, 1):
-        ex = x + side * 24 * s
-        ey = face_y - 8 * s
-        draw.ellipse((ex - eye_r, ey - eye_r, ex + eye_r, ey + eye_r), fill="white", outline=INK, width=3)
-        pupil = eye_r * .4
-        draw.ellipse((ex - pupil, ey - pupil, ex + pupil, ey + pupil), fill=INK)
-        if emotion in {"angry", "sad"}:
-            tilt = 8 * s if emotion == "angry" else -8 * s
-            draw.line((ex - side*eye_r, ey - eye_r - 6*s - side*tilt,
-                       ex + side*eye_r, ey - eye_r - 6*s + side*tilt), fill=INK, width=4)
-
-    my = face_y + 30 * s
-    if emotion == "happy":
-        draw.arc((x - 24*s, my - 24*s, x + 24*s, my + 14*s), 15, 165, fill=INK, width=5)
-    elif emotion in {"shock", "scared"}:
-        draw.ellipse((x - 14*s, my - 5*s, x + 14*s, my + 28*s), fill=(70, 12, 24), outline=INK, width=3)
-    elif huss:
-        # Open "huss" mouth that pulses with each breath.
-        mh = (6 + 16 * lift) * s
-        draw.ellipse((x - 14*s, my - 4*s, x + 14*s, my - 4*s + mh), fill=(70, 12, 24), outline=INK, width=3)
-    elif emotion in {"angry", "sad"}:
-        draw.arc((x - 20*s, my - 2*s, x + 20*s, my + 30*s), 200, 340, fill=INK, width=5)
-    else:
-        draw.line((x - 14*s, my, x + 14*s, my), fill=INK, width=5)
-
-    return y  # so props can follow the body
+def build_footer():
+    img = Image.new("RGBA", (TW, 60), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.text((TW / 2, 30), "General info only, not advice. Rules vary by place.",
+           font=font(26), fill=(235, 235, 240), anchor="mm",
+           stroke_width=4, stroke_fill=(16, 16, 28))
+    return img
 
 
-def draw_activity(draw, activity, x, ground_y, scale, t, animate):
-    s = scale
-    phase = (t % PERIOD) / PERIOD if animate else 0.0
-    lift = (1 - math.cos(math.tau * phase)) / 2
-    swing = math.sin(math.tau * phase)
+class Hud:
+    def __init__(self, title, episode, timeline):
+        self.blocks = build_title_blocks(title, episode)
+        self.chip_imgs = [build_chip(c["text"], c["color"]) for c in timeline["chips"]]
+        self.chips = timeline["chips"]
+        self.caps = timeline["captions"]
+        self.cap_imgs = [build_caption(c[2]) for c in self.caps]
+        self.footer = build_footer()
 
-    if activity == "basketball":
-        cx = x + 120 * s
-        cy = (ground_y - 30*s - abs(math.sin(math.pi * phase)) * 190 * s) if animate else ground_y - 30*s
-        r = 34 * s
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(235, 125, 40), outline=INK, width=4)
-        draw.line((cx - r, cy, cx + r, cy), fill=INK, width=3)
-        draw.line((cx, cy - r, cx, cy + r), fill=INK, width=3)
+    def draw(self, img, gt, trouble):
+        block, bottom = self.blocks[trouble]
+        img.paste(block, (0, 150), block)
 
-    elif activity == "jump_rope":
-        if animate:
-            squash = 0.25 + 0.75 * lift
-            top = ground_y - 330*s
-            bottom = ground_y + 10*s
-            mid = (top + bottom) / 2
-            half = (bottom - top) / 2 * squash
-            draw.ellipse((x - 150*s, mid - half, x + 150*s, mid + half), outline=(250, 235, 90), width=6)
-        else:
-            draw.arc((x - 150*s, ground_y - 120*s, x + 150*s, ground_y + 20*s), 0, 180, fill=(250, 235, 90), width=6)
+        shown = [i for i, c in enumerate(self.chips) if c["t0"] <= gt][-5:]
+        y = 150 + bottom + 34
+        for i in shown:
+            chip = self.chip_imgs[i]
+            age = gt - self.chips[i]["t0"]
+            if age < 0.32:
+                k = max(0.05, ease_out_back(age / 0.32))
+                chip = chip.resize((max(1, int(chip.width * k)), max(1, int(chip.height * k))),
+                                   Image.BILINEAR)
+                cy = y + (100 - chip.height) // 2
+            else:
+                cy = y
+            img.paste(chip, ((TW - chip.width) // 2, cy), chip)
+            y += 86
 
-    elif activity == "weights":
-        yy = ground_y - 160*s - (lift * 170 * s if animate else 0)
-        draw.line((x - 170*s, yy, x + 170*s, yy), fill=(70, 70, 80), width=max(2, int(10*s)))
-        for sx in (-1, 1):
-            draw.rounded_rectangle((x + sx*150*s - 16*s, yy - 55*s, x + sx*150*s + 16*s, yy + 55*s),
-                                   radius=8, fill=(45, 45, 60), outline=INK, width=3)
-
-    elif activity == "boxing":
-        for k, sx in enumerate((-1, 1)):
-            punch = max(0.0, math.sin(math.tau * phase + k * math.pi)) if animate else 0.0
-            gx = x + sx * (105 - 60 * punch) * s
-            gy = ground_y - 190*s - punch * 50 * s
-            r = (32 + 12 * punch) * s
-            draw.ellipse((gx - r, gy - r, gx + r, gy + r), fill=(215, 40, 50), outline=INK, width=4)
-
-    elif activity == "running":
-        if animate:
-            for i in range(5):
-                lx = (x + 260*s - ((t * 900 + i * 170) % 560) * s)
-                ly = ground_y - (60 + i * 55) * s
-                draw.line((lx, ly, lx + 90*s, ly), fill="white", width=4)
-
-    elif activity == "typing":
-        top = ground_y - 110*s
-        draw.rounded_rectangle((x - 140*s, top, x + 140*s, top + 20*s), radius=6, fill=(150, 95, 55), outline=INK, width=3)
-        draw.rectangle((x - 80*s, top - 80*s, x + 80*s, top), fill=(35, 40, 55), outline=INK, width=4)
-        draw.rectangle((x - 66*s, top - 68*s, x + 66*s, top - 10*s), fill=(80, 190, 240))
-        if animate and swing > 0:
-            draw.rectangle((x - 40*s, top - 50*s, x + 40*s, top - 38*s), fill=(250, 250, 250))
-
-
-def draw_effect(draw, effect, beat_t):
-    cx, cy = TW / 2, 520
-    if effect == "explosion":
-        radius = 35 + ease(beat_t / .35) * 220
-        points = []
-        for i in range(24):
-            r = radius * (1 if i % 2 == 0 else .55)
-            angle = i / 24 * math.tau
-            points.append((cx + math.cos(angle) * r, cy + math.sin(angle) * r))
-        draw.polygon(points, fill=(255, 130, 20), outline=(220, 40, 40))
-    elif effect == "fire":
-        for i in range(6):
-            x = 45 + i * 120
-            height = 140 + 55 * math.sin(beat_t * 10 + i)
-            draw.polygon(((x - 35, 1050), (x, 1050 - height), (x + 35, 1050)), fill=(255, 100, 15))
-    elif effect == "shock" and beat_t < .12:
-        draw.rectangle((0, 0, TW, TH), fill="white")
-    elif effect == "sparkle":
-        rng = random.Random(7)
-        for i in range(12):
-            x, y = rng.randint(35, TW - 35), rng.randint(150, 900)
-            r = 8 + 10 * abs(math.sin(beat_t * 7 + i))
-            draw.line((x - r, y, x + r, y), fill=(255, 245, 140), width=4)
-            draw.line((x, y - r, x, y + r), fill=(255, 245, 140), width=4)
+        for k, (s, e, _) in enumerate(self.caps):
+            if s <= gt < e:
+                cap = self.cap_imgs[k]
+                age = gt - s
+                if age < 0.1:
+                    sc = 0.92 + 0.08 * (age / 0.1)
+                    cap = cap.resize((int(cap.width * sc), int(cap.height * sc)), Image.BILINEAR)
+                img.paste(cap, ((TW - cap.width) // 2, 1180 + (self.cap_imgs[k].height - cap.height) // 2), cap)
+                break
+        img.paste(self.footer, (0, 1480), self.footer)
 
 
 # ---------------------------------------------------------------------
-# BLENDER RENDERER
+# VIDEO RENDER
 # ---------------------------------------------------------------------
 
-def blender_background(beats, durations, folder):
-    blender = shutil.which("blender")
-    if not blender:
-        raise RuntimeError("Blender is not installed.")
+_BG_CACHE = {}
 
-    scene_script = Path(__file__).with_name("blender_scene.py")
-    if not scene_script.exists():
-        raise RuntimeError("blender_scene.py is missing.")
 
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+def scene_background(scene, RW, RH):
+    key = (scene.name, RW, RH)
+    if key not in _BG_CACHE:
+        top, bot = np.array(scene.bg[0], float), np.array(scene.bg[1], float)
+        k = np.linspace(0, 1, RH)[:, None]
+        col = (top + (bot - top) * k).astype(np.uint8)
+        arr = np.repeat(col[:, None, :], RW, axis=1)
+        _BG_CACHE[key] = Image.fromarray(arr, "RGB")
+    return _BG_CACHE[key]
 
-    payload = folder / "blender_beats.json"
+
+def render_blocks(beats, timeline, title, episode, folder):
+    ss = max(1.0, CFG["supersample"])
+    RW, RH = int(TW * ss) // 2 * 2, int(TH * ss) // 2 * 2
+    hud = Hud(title, episode, timeline)
     output = folder / "bg.mp4"
 
-    payload.write_text(
-        json.dumps({
-            "beats": beats,
-            "durations": durations,
-            "fps": CFG["blender_fps"],
-        }),
-        encoding="utf-8",
-    )
-
-    command = [
-        blender, "-b", "-t", "2",
-        "--python-exit-code", "1",
-        "--python", str(scene_script),
-        "--", str(payload), str(output),
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=5400)
-
-    # Blender prints Python tracebacks to stdout and may still exit 0 on some
-    # builds, so check for our completion marker too.
-    if result.returncode != 0 or "3D_RENDER_COMPLETE" not in result.stdout:
-        raise RuntimeError(
-            "Blender rendering failed:\n"
-            + result.stdout[-4000:] + result.stderr[-2000:]
-        )
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("Blender did not create the background video.")
-
-    return output, []
-
-
-# ---------------------------------------------------------------------
-# TOON RENDERER
-# ---------------------------------------------------------------------
-
-def toon_background(beats, durations, folder):
-    bgs = {}
-
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font = (
-        ImageFont.truetype(font_path, 22)
-        if Path(font_path).exists() else ImageFont.load_default()
-    )
-
-    output = folder / "bg.mp4"
     command = [
         "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{TW}x{TH}", "-r", str(FPS), "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", str(output),
     ]
-    process = subprocess.Popen(
-        command, stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     frame_number = 0
-    exact = 0.0  # keeps video length locked to the audio (no per-beat rounding drift)
-
+    exact = 0.0
+    started = time.time()
     try:
-        for index, (beat, duration) in enumerate(zip(beats, durations)):
-            scene = beat["scene"]
-            if scene not in bgs:
-                bgs[scene] = make_bg(scene)
+        for bi, beat in enumerate(beats):
+            scene = get_scene(beat["scene"])
+            bg = scene_background(scene, RW, RH)
+            exact += beat["_dur"] * FPS
+            end_frame = max(frame_number + 1, round(exact))
+            n = end_frame - frame_number
 
-            main = beat["chars"][0]
-            has_pigeon = any(c["who"] == "pigeon" for c in beat["chars"])
-            animate = main["action"] == "huss"
-
-            exact += duration * FPS
-            start_frame = frame_number
-            end_frame = max(start_frame + 1, round(exact))
-
-            for frame in range(start_frame, end_frame):
-                beat_t = (frame - start_frame) / FPS
-                img = bgs[scene].copy()
+            for f in range(n):
+                t = f / FPS
+                u = f / max(1, n - 1)
+                img = bg.copy()
                 draw = ImageDraw.Draw(img)
-
-                if beat.get("party"):
-                    draw_party(draw, frame / FPS)
-                draw_effect(draw, beat["fx"], beat_t)
-
-                if has_pigeon:
-                    draw_pigeon(draw, TW * .84, 1005, 1.0, beat_t)
-
-                cx, ground, scale = TW * .5, 1030, 1.45
-                body_y = draw_character(
-                    draw, cx, ground, scale, main["emotion"], main["action"],
-                    beat["activity"], beat_t,
-                )
-                draw_activity(draw, beat["activity"], cx, ground, scale, beat_t, animate)
-
-                progress = (index + beat_t / max(duration, .1)) / len(beats)
-                draw.text((TW / 2, 150), "GRIND LEVEL", font=font, fill="white",
-                          anchor="mm", stroke_width=2, stroke_fill=INK)
-                draw.rounded_rectangle((90, 175, 630, 205), radius=14,
-                                       fill=(25, 25, 40), outline="white", width=2)
-                draw.rounded_rectangle(
-                    (94, 179, 94 + max(5, int(532 * progress)), 201), radius=11,
-                    fill=mix((65, 220, 100), (245, 55, 55), progress),
-                )
-
-                # Punch-in on every cut, extra shake on big effects.
-                zoom = 1.0 + .075 * (1 - ease(beat_t / .25)) + .012 * math.sin(beat_t * 2)
-                shake = (
-                    8 * max(0, 1 - beat_t / .5)
-                    if beat["fx"] in {"explosion", "shock"} else 0
-                )
-                crop_w, crop_h = TW / zoom, TH / zoom
-                left = clamp(TW/2 + math.sin(frame*2.7)*shake - crop_w/2, 0, TW - crop_w)
-                top = clamp(TH/2 + math.cos(frame*3.1)*shake - crop_h/2, 0, TH - crop_h)
-                crop = img.crop((
-                    int(left), int(top),
-                    max(int(left) + 1, int(math.ceil(clamp(left + crop_w, 1, TW)))),
-                    max(int(top) + 1, int(math.ceil(clamp(top + crop_h, 1, TH)))),
-                )).resize((TW, TH), Image.Resampling.BILINEAR)
-
-                process.stdin.write(crop.tobytes())
+                cam, dyn = compose_frame(scene, beat, bi, t, u)
+                draw_world(draw, cam, scene, dyn, RW, RH)
+                if (RW, RH) != (TW, TH):
+                    img = img.resize((TW, TH), Image.LANCZOS)
+                hud.draw(img, beat["_t0"] + t, beat["_trouble"])
+                proc.stdin.write(img.tobytes())
 
             frame_number = end_frame
-
+            if bi % 4 == 3:
+                print(f"  rendered {bi + 1}/{len(beats)} beats ({time.time() - started:.0f}s)", flush=True)
     except Exception:
         try:
-            process.stdin.close()
+            proc.stdin.close()
         except Exception:
             pass
-        process.kill()
-        process.wait()
+        proc.kill()
+        proc.wait()
         raise
 
-    process.stdin.close()
-    if process.wait():
-        raise RuntimeError("Cartoon video encode failed (ffmpeg returned an error).")
-
-    return output, []
-
-
-# ---------------------------------------------------------------------
-# STOCK FOOTAGE
-# ---------------------------------------------------------------------
-
-def pixabay_candidates(query):
-    key = os.getenv("PIXABAY_API_KEY")
-    if not key:
-        return []
-    response = requests.get(
-        "https://pixabay.com/api/videos/",
-        params={"key": key, "q": query[:100], "per_page": 15,
-                "safesearch": "true", "video_type": "film"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    results = []
-    for hit in response.json().get("hits", []):
-        videos = hit.get("videos", {})
-        chosen = next(
-            (videos[k] for k in ("medium", "small", "large")
-             if videos.get(k, {}).get("url")),
-            None,
-        )
-        if chosen:
-            results.append((chosen["url"], hit.get("pageURL", "")))
-    return results
-
-
-def pexels_candidates(query):
-    key = os.getenv("PEXELS_API_KEY")
-    if not key:
-        return []
-    response = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers={"Authorization": key},
-        params={"query": query, "orientation": "portrait", "per_page": 12},
-        timeout=30,
-    )
-    response.raise_for_status()
-    results = []
-    for video in response.json().get("videos", []):
-        files = [
-            f for f in video.get("video_files", [])
-            if f.get("file_type") == "video/mp4" and f.get("link")
-        ]
-        if files:
-            chosen = min(files, key=lambda f: abs((f.get("width") or 720) - 720))
-            results.append((chosen["link"], video.get("url", "")))
-    return results
-
-
-def download(url, path):
-    with requests.get(url, stream=True, timeout=90) as response:
-        response.raise_for_status()
-        with path.open("wb") as out:
-            for chunk in response.iter_content(1 << 20):
-                if chunk:
-                    out.write(chunk)
-
-
-def make_seg(raw, duration, output):
-    raw_duration = probe_duration(raw)
-    start = random.uniform(0, max(0, raw_duration - duration - .2))
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,eq=saturation=1.15:contrast=1.05,setsar=1,fps=24"
-    )
-    run([
-        "ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", str(raw), "-an",
-        "-t", f"{duration:.2f}", "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-        "-pix_fmt", "yuv420p", str(output),
-    ])
-
-
-def build_background(beats, durations, folder):
-    local = pick_files(ROOT / "footage", VIDEO_EXT)
-    api_search = pixabay_candidates if os.getenv("PIXABAY_API_KEY") else pexels_candidates
-    api_enabled = bool(os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY"))
-
-    pool, sources, segments, used = [], [], [], set()
-
-    for index, (beat, duration) in enumerate(zip(beats, durations)):
-        raw = None
-
-        if api_enabled:
-            try:
-                candidates = [
-                    x for x in api_search(beat["visual"] or beat["scene"])
-                    if x[0] not in used
-                ]
-                if candidates:
-                    url, page = random.choice(candidates[:6])
-                    raw = folder / f"raw_{index}.mp4"
-                    download(url, raw)
-                    used.add(url)
-                    pool.append(raw)
-                    if page:
-                        sources.append(page)
-            except Exception as exc:
-                print("Stock footage lookup failed:", exc)
-
-        if raw is None and pool:
-            raw = random.choice(pool)
-        if raw is None and local:
-            raw = random.choice(local)
-        if raw is None:
-            raise RuntimeError("Stock visuals selected, but no footage was available.")
-
-        segment = folder / f"segment_{index}.mp4"
-        make_seg(raw, duration, segment)
-        segments.append(segment)
-
-    concat = folder / "segments.txt"
-    concat.write_text("".join(f"file '{p.name}'\n" for p in segments), encoding="utf-8")
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat.name,
-         "-c", "copy", "bg.mp4"], cwd=folder)
-
-    return folder / "bg.mp4", sources
+    proc.stdin.close()
+    if proc.wait():
+        raise RuntimeError("Video encode failed (ffmpeg returned an error).")
+    return output
 
 
 # ---------------------------------------------------------------------
-# FINAL VIDEO COMPOSITION
+# SOUND EFFECTS + FINAL MIX
 # ---------------------------------------------------------------------
 
-def render(background, voice, workdir, output, duration):
+def build_sfx(events, total, folder):
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=1250:duration=0.1",
+         "-af", "afade=t=out:st=0.03:d=0.07,volume=0.55", "-ar", "24000", "pop.wav"], cwd=folder)
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=62:duration=0.4",
+         "-af", "afade=t=out:st=0.05:d=0.35,volume=1.6", "-ar", "24000", "thud.wav"], cwd=folder)
+
+    command = ["ffmpeg", "-y", "-f", "lavfi", "-t", f"{total + 1:.2f}",
+               "-i", "anullsrc=r=24000:cl=mono"]
+    graph = []
+    for i, (t, kind) in enumerate(events):
+        command += ["-i", f"{kind}.wav"]
+        graph.append(f"[{i + 1}:a]adelay={int(t * 1000)}:all=1[e{i}]")
+    labels = "[0:a]" + "".join(f"[e{i}]" for i in range(len(events)))
+    graph.append(f"{labels}amix=inputs={len(events) + 1}:duration=first:normalize=0[out]")
+    command += ["-filter_complex", ";".join(graph), "-map", "[out]",
+                "-ac", "1", "-ar", "24000", "sfx.wav"]
+    run(command, cwd=folder)
+    return folder / "sfx.wav"
+
+
+def mix_final(background, voice, sfx, workdir, output, duration):
     music_files = pick_files(ROOT / "music", AUDIO_EXT)
     music = random.choice(music_files) if music_files else None
 
-    command = ["ffmpeg", "-y", "-i", str(background), "-i", str(voice)]
-
-    # Hold the last frame if the video is a hair short, scale, then burn
-    # captions at the final 1080x1920 resolution.
-    video_filter = (
-        "[0:v]tpad=stop_mode=clone:stop_duration=2,"
-        "scale=1080:1920:flags=lanczos,ass=captions.ass[v];"
-    )
-
+    command = ["ffmpeg", "-y", "-i", str(background), "-i", str(voice), "-i", str(sfx)]
+    graph = ("[1:a]loudnorm=I=-15:TP=-1.5:LRA=9[v];"
+             "[2:a]volume=0.6[s];")
     if music:
         command += ["-stream_loop", "-1", "-i", str(music)]
-        audio_filter = (
-            f"[2:a]volume={CFG['music_volume']}[music];"
-            "[1:a][music]amix=inputs=2:duration=first:"
-            "dropout_transition=0:normalize=0[a]"
-        )
+        graph += (f"[3:a]volume={CFG['music_volume']}[m];"
+                  "[v][s][m]amix=inputs=3:duration=first:dropout_transition=0:normalize=0[a]")
     else:
-        audio_filter = "[1:a]anull[a]"
+        graph += "[v][s]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
 
-    command += [
-        "-filter_complex", video_filter + audio_filter,
-        "-map", "[v]", "-map", "[a]",
-        "-t", f"{duration + .3:.2f}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", str(output),
-    ]
+    command += ["-filter_complex", graph, "-map", "0:v", "-map", "[a]",
+                "-t", f"{duration + 0.1:.2f}", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
     run(command, cwd=workdir)
-
     return music.name if music else None
 
 
@@ -1307,42 +1934,30 @@ def make_video(index):
     episode_number = max([e.get("ep", 0) for e in state["episodes"]] + [0]) + 1
 
     data = write_episode(episode_number, state)
-
     folder = OUT_DAY / f"{index:02d}_ep{episode_number}_{safe_name(data['title'])}"
     folder.mkdir(parents=True, exist_ok=True)
-
     beats = data["beats"]
 
     (folder / "script.txt").write_text(
-        "\n".join(f"[{b['label']}|{b['kind']}] {b['text']}" for b in beats),
-        encoding="utf-8",
-    )
+        "\n".join(f"[{b['scene']}] {b['text']}" for b in beats), encoding="utf-8")
 
     print("Generating narration...")
     durations = voice_beats(beats, folder)
-    total_duration = sum(durations)
 
-    print("Generating captions...")
-    words = transcribe_words(folder / "voice.wav", beats, durations)
-    write_ass(words, beats, durations, episode_number, folder / "captions.ass")
+    timeline = build_timeline(beats, durations)
+    total = timeline["total"]
+    print(f"Video length: {total:.1f}s, {len(beats)} beats, {len(timeline['chips'])} chips")
 
-    print("Rendering animated scenes...")
-    if CFG["visuals"] == "blender":
-        background, sources = blender_background(beats, durations, folder)
-    elif CFG["visuals"] == "toon":
-        background, sources = toon_background(beats, durations, folder)
-    elif CFG["visuals"] == "stock":
-        background, sources = build_background(beats, durations, folder)
-    else:
-        raise ValueError("VISUALS must be 'blender', 'toon', or 'stock'.")
+    print("Rendering 3D scenes...")
+    background = render_blocks(beats, timeline, data["title"], episode_number, folder)
 
-    print("Compositing final Short...")
-    music = render(background, folder / "voice.wav", folder,
-                   folder / "video.mp4", total_duration)
+    print("Mixing sound...")
+    sfx = build_sfx(timeline["sfx"], total, folder)
+    music = mix_final(background, folder / "voice.wav", sfx, folder,
+                      folder / "video.mp4", total)
 
-    for pattern in ("voice_raw_*.wav", "voice_[0-9]*.wav", "raw_*.mp4",
-                    "segment_*.mp4", "segments.txt", "voice_list.txt",
-                    "bg.mp4", "blender_beats.json"):
+    for pattern in ("voice_raw_*", "voice_[0-9]*.wav", "voice_list.txt", "bg.mp4",
+                    "pop.wav", "thud.wav", "sfx.wav"):
         for path in folder.glob(pattern):
             path.unlink(missing_ok=True)
 
@@ -1350,35 +1965,29 @@ def make_video(index):
         "episode": episode_number,
         "series": SERIES_NAME,
         "title": data["title"],
-        "description": data.get("description", "") + "\n\nFictional comedy series. #Shorts",
+        "description": data.get("description", "") + "\n\nFictional comedy story. General info only, not advice. #Shorts",
         "summary": data.get("summary", ""),
         "tags": data.get("tags", []),
-        "activity": data.get("activity"),
-        "duration_sec": round(total_duration, 1),
-        "voice_engine": "Piper",
-        "voice_model": CFG["voice"],
-        "visual_style": CFG["visuals"],
-        "footage_sources": sources,
+        "duration_sec": round(total, 1),
+        "voice": CFG["voice"] if _TTS_STATE["edge_ok"] else "piper (fallback)",
         "music_used": music,
         "review_checklist": [
             "Watch the complete video before uploading.",
-            "Check narration and caption timing.",
-            "Confirm any music or stock-footage license.",
-            "Apply synthetic-content disclosure if applicable.",
+            "Check the facts in the consequence tags before posting.",
+            "Confirm any music license.",
+            "Apply the synthetic-content disclosure if applicable.",
         ],
     }
     (folder / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    # Only record the topic once the video actually succeeded.
-    if data["topic"] not in state["topics"]:
-        state["topics"].append(data["topic"])
-    state["episodes"].append({
-        "ep": episode_number,
-        "topic": data["topic"],
-        "title": data["title"],
-        "summary": data.get("summary", ""),
-    })
-    save_state(state)
+    if not CFG["demo"]:
+        if data["topic"] not in state["topics"]:
+            state["topics"].append(data["topic"])
+        state["episodes"].append({
+            "ep": episode_number, "topic": data["topic"],
+            "title": data["title"], "summary": data.get("summary", ""),
+        })
+        save_state(state)
 
     return str(folder), data["title"]
 
@@ -1393,11 +2002,8 @@ def notify(message):
     if not token or not chat:
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": message[:4000]},
-            timeout=15,
-        )
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat, "text": message[:4000]}, timeout=15)
     except Exception as exc:
         print("Telegram message failed:", exc)
 
@@ -1412,75 +2018,53 @@ def notify_video(path, caption):
             response = requests.post(
                 f"https://api.telegram.org/bot{token}/sendVideo",
                 data={"chat_id": chat, "caption": caption[:900]},
-                files={"video": video},
-                timeout=180,
-            )
+                files={"video": video}, timeout=180)
         response.raise_for_status()
     except Exception as exc:
         print("Telegram video notification failed:", exc)
 
 
 # ---------------------------------------------------------------------
-# PREFLIGHT CHECKS
+# PREFLIGHT + MAIN
 # ---------------------------------------------------------------------
 
 def preflight():
     errors = []
-
-    if CFG["visuals"] not in {"blender", "toon", "stock"}:
-        errors.append("VISUALS must be 'blender', 'toon', or 'stock'.")
-
-    if CFG["visuals"] == "blender":
-        if not shutil.which("blender"):
-            errors.append("Blender executable not found.")
-        if not Path(__file__).with_name("blender_scene.py").exists():
-            errors.append("blender_scene.py not found.")
-
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             errors.append(f"{tool} is missing from PATH.")
 
-    piper = CFG["piper_bin"]
-    if not (shutil.which(piper) or Path(piper).exists()):
-        errors.append(f"Piper executable not found: {piper}")
-    if not Path(CFG["piper_model"]).exists():
-        errors.append(f"Piper model is missing: {CFG['piper_model']}")
+    import importlib.util
+    has_edge = importlib.util.find_spec("edge_tts") is not None
+    has_piper = bool(shutil.which(CFG["piper_bin"])) and Path(CFG["piper_model"]).exists()
+    if not has_edge and not has_piper:
+        errors.append("No narration voice: install edge-tts (pip install edge-tts) or Piper.")
+    elif not has_edge:
+        print("NOTE: edge-tts not installed, using the robotic Piper voice.")
+        _TTS_STATE["edge_ok"] = False
 
-    if CFG["visuals"] == "stock" and not (
-        os.getenv("PIXABAY_API_KEY") or os.getenv("PEXELS_API_KEY")
-        or pick_files(ROOT / "footage", VIDEO_EXT)
-    ):
-        errors.append("Stock mode requires an API key or footage in ./footage.")
-
-    if not os.getenv("GEMINI_API_KEY"):
+    if not CFG["demo"] and not os.getenv("GEMINI_API_KEY"):
         try:
             requests.get(CFG["ollama_url"].rsplit("/api", 1)[0], timeout=4)
         except Exception:
-            errors.append("Set GEMINI_API_KEY or run a reachable Ollama server.")
-
+            errors.append("Set GEMINI_API_KEY or run a reachable Ollama server (or set DEMO=1).")
     return errors
 
-
-# ---------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------
 
 def main():
     OUT_DAY.mkdir(parents=True, exist_ok=True)
 
-    print("Starting Shorts Factory v4 (Huss format)...")
-    print("Visual engine:", CFG["visuals"])
-    print("Videos requested:", CFG["videos_per_run"])
-
-    init_tts()
+    print("Starting Shorts Factory v5 (blocky 3D story style)...")
+    print("Videos requested:", CFG["videos_per_run"], "| demo story:", CFG["demo"])
 
     errors = preflight()
     completed = []
 
     if not errors:
         start_index = len([p for p in OUT_DAY.iterdir() if p.is_dir()]) + 1
+        count = 1 if CFG["demo"] else CFG["videos_per_run"]
 
-        for offset in range(CFG["videos_per_run"]):
+        for offset in range(count):
             try:
                 folder, title = make_video(start_index + offset)
                 completed.append((title, folder))
@@ -1490,10 +2074,10 @@ def main():
                 message = f"Video {offset + 1}: {exc}"
                 errors.append(message)
                 print(message)
-                if "429" in str(exc):
-                    break  # out of Gemini quota; stop instead of burning more
                 with (OUT_DAY / "errors.log").open("a", encoding="utf-8") as log:
                     log.write(traceback.format_exc() + "\n")
+                if "429" in str(exc):
+                    break  # out of Gemini quota; stop instead of burning more
     else:
         for error in errors:
             print("PREFLIGHT:", error)
@@ -1502,22 +2086,19 @@ def main():
         f"# Daily report - {TODAY}",
         f"Completed: {len(completed)}",
         f"Errors: {len(errors)}",
-        f"Voice: Piper / {CFG['voice']}",
-        f"Visuals: {CFG['visuals']}",
+        f"Voice: {CFG['voice']}",
         "",
     ]
     report.extend(f"- COMPLETE: {title} -> {folder}" for title, folder in completed)
     report.extend(f"- ERROR: {error}" for error in errors)
     report.append("\nReview each video's video.mp4 and meta.json before uploading.")
-
     report_text = "\n".join(report)
+
     with (OUT_DAY / "report.md").open("a", encoding="utf-8") as out:
         out.write(report_text + "\n\n")
-
     print(report_text)
     notify(report_text)
 
-    # Make the GitHub Action fail visibly when nothing was produced.
     if errors and not completed:
         sys.exit(1)
 
