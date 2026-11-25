@@ -77,6 +77,12 @@
       "topic": "heavy lifting",
       "title": "The Weight of Partying",
       "summary": "A blocky avatar ignores the town party to lift absurd amounts of heavy weights."
+    },
+    {
+      "ep": 14,
+      "topic": "grocery store cheese testing",
+      "title": "THE RETAIL TASTE TEST",
+      "summary": "A shopper named Leo attempts a DIY cheese tasting marathon and faces unexpected consequences."
     }
   ],
   "topics": [
@@ -100,6 +106,7 @@
     "laser haircut helmet",
     "nhl supermarket skating",
     "garden gnome peace treaty",
-    "heavy lifting"
+    "heavy lifting",
+    "grocery store cheese testing"
   ]
 }
