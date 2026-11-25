@@ -83,6 +83,12 @@
       "topic": "grocery store cheese testing",
       "title": "THE RETAIL TASTE TEST",
       "summary": "A shopper named Leo attempts a DIY cheese tasting marathon and faces unexpected consequences."
+    },
+    {
+      "ep": 15,
+      "topic": "school",
+      "title": "THE FAKE BASKETBALL INJURY",
+      "summary": "Leo fakes a knee injury to avoid a history test and ends up getting caught by his teacher."
     }
   ],
   "topics": [
@@ -107,6 +113,7 @@
     "nhl supermarket skating",
     "garden gnome peace treaty",
     "heavy lifting",
-    "grocery store cheese testing"
+    "grocery store cheese testing",
+    "school"
   ]
 }
