@@ -89,6 +89,12 @@
       "topic": "school",
       "title": "THE FAKE BASKETBALL INJURY",
       "summary": "Leo fakes a knee injury to avoid a history test and ends up getting caught by his teacher."
+    },
+    {
+      "ep": 16,
+      "topic": "driving and traffic",
+      "title": "THE DRIVEWAY MINT PRINT",
+      "summary": "Leo prints fake paper license plates on his home printer and gets pulled over right away."
     }
   ],
   "topics": [
@@ -114,6 +120,7 @@
     "garden gnome peace treaty",
     "heavy lifting",
     "grocery store cheese testing",
-    "school"
+    "school",
+    "driving and traffic"
   ]
 }
