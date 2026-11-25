@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +24,7 @@ jobs:
       - name: Install system tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg blender fonts-dejavu-core espeak-ng
-          blender --version | head -n 1
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
@@ -33,42 +32,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Download Piper voice model
+      - name: Download caption font
         run: |
-          mkdir -p models
-          python - <<'PY'
-          from huggingface_hub import hf_hub_download
-          from pathlib import Path
-          import shutil
-
-          files = [
-              "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
-              "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
-          ]
-          for filename in files:
-              downloaded = hf_hub_download(
-                  repo_id="rhasspy/piper-voices",
-                  filename=filename,
-                  repo_type="model",
-              )
-              destination = Path("models") / Path(filename).name
-              shutil.copy2(downloaded, destination)
-              print(f"Downloaded {destination}")
-          PY
+          mkdir -p fonts
+          curl -fsSL -o fonts/Poppins-Bold.ttf \
+            https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf || echo "Font download failed, using fallback font"
 
       - name: Make videos
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           VIDEOS_PER_RUN: ${{ vars.VIDEOS_PER_RUN }}
-          PIPER_BIN: piper
-          VISUALS: toon
-          BLENDER_ENGINE: CYCLES
-          BLENDER_SAMPLES: "24"
-          VOICE: en_US-lessac-medium
+          DEMO: ${{ vars.DEMO }}
+          VOICE: ${{ vars.VOICE }}
         run: python -u pipeline.py
 
       - name: Save topic history
@@ -86,3 +63,4 @@ jobs:
           name: shorts-${{ github.run_number }}
           path: output/
           retention-days: 14
+
