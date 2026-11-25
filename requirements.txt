@@ -1,6 +1,4 @@
 requests>=2.31.0
 Pillow>=10.0.0
 numpy
-soundfile
-huggingface_hub
-piper-tts
+edge-tts>=7.0.0
