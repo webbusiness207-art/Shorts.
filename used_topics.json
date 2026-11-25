@@ -95,6 +95,12 @@
       "topic": "driving and traffic",
       "title": "THE DRIVEWAY MINT PRINT",
       "summary": "Leo prints fake paper license plates on his home printer and gets pulled over right away."
+    },
+    {
+      "ep": 17,
+      "topic": "work",
+      "title": "THE FAKE SICK BOSS BATTLE",
+      "summary": "A worker fakes sick to go hoop but gets caught by his boss on the broadcast."
     }
   ],
   "topics": [
@@ -121,6 +127,7 @@
     "heavy lifting",
     "grocery store cheese testing",
     "school",
-    "driving and traffic"
+    "driving and traffic",
+    "work"
   ]
 }
