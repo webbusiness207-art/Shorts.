@@ -101,6 +101,12 @@
       "topic": "work",
       "title": "THE FAKE SICK BOSS BATTLE",
       "summary": "A worker fakes sick to go hoop but gets caught by his boss on the broadcast."
+    },
+    {
+      "ep": 18,
+      "topic": "restaurants",
+      "title": "DRONE DELIVERY DINNER DISASTER",
+      "summary": "A chronically online guy uses a tactical drone to pick up takeout and learns about aviation laws the hard way."
     }
   ],
   "topics": [
@@ -128,6 +134,7 @@
     "grocery store cheese testing",
     "school",
     "driving and traffic",
-    "work"
+    "work",
+    "restaurants"
   ]
 }
