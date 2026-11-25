@@ -51,7 +51,7 @@ def env_float(name, default):
         return default
 
 
-BRAINROT = os.getenv("BRAINROT", "1").strip() != "0"
+BRAINROT = os.getenv("BRAINROT", "0").strip() == "1"
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
@@ -59,14 +59,14 @@ AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 CFG = {
     "videos_per_run": max(1, min(5, env_int("VIDEOS_PER_RUN", 1))),
     "demo": os.getenv("DEMO", "0").strip() == "1",
-    # Modern brainrot edit: split-screen runner, kinetic captions, zoom
-    # punches, glitch hits, meme sound effects. BRAINROT=0 turns it off.
+    # Optional extra "edit" effects (split-screen runner, zoom punches, glitch
+    # hits, meme sounds). OFF by default. Set the BRAINROT variable to 1 to try.
     "brainrot": BRAINROT,
     # Natural-sounding Microsoft neural voice (free, no key). Good male
     # options: en-US-AndrewNeural, en-US-BrianNeural, en-US-GuyNeural,
     # en-US-ChristopherNeural. Female: en-US-AriaNeural, en-US-JennyNeural.
     "voice": os.getenv("VOICE", "").strip() or "en-US-AndrewNeural",
-    "voice_rate": os.getenv("VOICE_RATE", "").strip() or ("+16%" if BRAINROT else "+8%"),
+    "voice_rate": os.getenv("VOICE_RATE", "").strip() or "+12%",
     "voice_pitch": os.getenv("VOICE_PITCH", "").strip() or "+0Hz",
     # Piper is only the fallback if the neural voice cannot be reached.
     "piper_bin": os.getenv("PIPER_BIN", "piper"),
@@ -1525,7 +1525,7 @@ storytime" style: a hyped, chaotic, chronically-online narrator tells a funny
 story about someone's dumb decision and what could realistically happen next,
 over a split screen of endless-runner gameplay.
 
-STRUCTURE (13 to 16 beats)
+STRUCTURE (AT LEAST 12 beats, up to 16; short lines, one idea each)
 1. HOOK beat: states the dumb move and that the hero is cooked / got caught.
 2. Beats that show how it started, then how it escalated.
 3. Several beats that explain the real-world consequences ("In many places...",
@@ -1538,14 +1538,23 @@ Topic area for this episode: {area}
 Loose trend inspiration (optional): {twist}
 Do NOT repeat these topics: {json.dumps(recent[-30:])}
 
-VOICE AND SLANG (this is what makes it brainrot)
-- Talk like a chronically online narrator. Work 1-2 slang terms into most
-  lines, never every word, and keep every sentence easy to follow out loud.
-- Slang to mix: cooked, locked in, aura (plus or minus), no cap, fr, lowkey,
-  bro, bruh, chat ("chat, is this real?"), sigma, mid, NPC, slop, brain AFK,
-  "only in Ohio", six seven, huss.
+VOICE AND SLANG (this is the whole point: it must sound like brainrot)
+- The narrator is a hyped, chronically online Gen Z voice. Every line has 2 or
+  3 slang terms or meme phrases, but it must still be easy to follow out loud.
+- Address the audience as "chat" or "bro" and react live ("chat, he did NOT").
+- Slang and meme phrases to mix freely: cooked, so cooked, locked in, lock in,
+  aura, "-5000 aura", "plus aura", no cap, fr fr, lowkey, highkey, bro, bruh,
+  chat is this real, sigma, mid, NPC, slop, brain AFK, brainrot, "only in Ohio",
+  six seven, huss, skibidi, rizz, mewing, fanum tax, sus, sheesh, delulu,
+  "it's giving", "bro thought he was him", "bro really said", "not the ...",
+  "ate and left no crumbs", "huge L", "massive W", "side quest", "main
+  character energy", "I'm not even lying", "the audacity", "ratio".
+- Open with a hook like "Bro really thought he could..." or "Chat, this man
+  is so cooked." Narrate dumb decisions with dramatic, deadpan confidence.
 - Chips are a mix of rule tags with a trailing * ("FAKING SICK = LYING*") and
-  brainrot tags ("-5000 AURA", "+500 AURA", "COOKED", "NPC MOVE", "ONLY IN OHIO").
+  brainrot tags ("-5000 AURA", "+500 AURA", "COOKED", "NPC MOVE", "ONLY IN OHIO",
+  "HUGE L", "BRAIN AFK").
+- "hl" should pick the slang words so they pop in the captions.
 - Never use sexual, hateful or insulting slang. No swearing.
 
 RULES
@@ -1602,10 +1611,10 @@ fx: none or shake
             words = sum(len(x["text"].split()) for x in beats)
             chips = sum(1 for x in beats if x["chip"])
 
-            if not 10 <= len(beats) <= 20 or not 70 <= words <= 190:
+            if not 8 <= len(beats) <= 20 or not 60 <= words <= 190:
                 raise ValueError(f"Story length outside limits: {len(beats)} beats, {words} words")
-            if chips < 3:
-                raise ValueError("Story needs at least 3 consequence chips.")
+            if chips < 2:
+                raise ValueError("Story needs at least 2 consequence chips.")
 
             data["beats"] = beats
             data["title"] = str(data.get("title", f"Dumb Moves #{episode_number}"))[:60]
@@ -1859,7 +1868,7 @@ def stroke_text(draw, xy, text, fnt, fill, stroke=6, anchor="la"):
 def build_title_blocks(title, episode):
     blocks = {}
     title = title.upper()
-    labels = TROUBLE_BR if CFG["brainrot"] else TROUBLE
+    labels = TROUBLE_BR
     for key, (label, colour) in labels.items():
         img = Image.new("RGBA", (TW, 330), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
@@ -1988,10 +1997,12 @@ class Hud:
                 for i, wd in enumerate(words):
                     if wd[2] <= gt:
                         upto = i
+                if not self.br:
+                    upto = len(words) - 1          # show the whole phrase at once
                 cap = self.caption_img(k, upto)
                 h0 = cap.height
                 age = gt - words[upto][2]
-                if age < 0.12:                      # pop on every new word
+                if self.br and age < 0.12:                      # pop on every new word
                     sc = 1.0 + 0.14 * (1 - age / 0.12)
                     cap = cap.resize((int(cap.width * sc), int(cap.height * sc)), Image.BILINEAR)
                 cy = 1150 if self.br else 1180 + h0 // 2
