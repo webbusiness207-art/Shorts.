@@ -51,17 +51,22 @@ def env_float(name, default):
         return default
 
 
+BRAINROT = os.getenv("BRAINROT", "1").strip() != "0"
+
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 
 CFG = {
     "videos_per_run": max(1, min(5, env_int("VIDEOS_PER_RUN", 1))),
     "demo": os.getenv("DEMO", "0").strip() == "1",
+    # Modern brainrot edit: split-screen runner, kinetic captions, zoom
+    # punches, glitch hits, meme sound effects. BRAINROT=0 turns it off.
+    "brainrot": BRAINROT,
     # Natural-sounding Microsoft neural voice (free, no key). Good male
     # options: en-US-AndrewNeural, en-US-BrianNeural, en-US-GuyNeural,
     # en-US-ChristopherNeural. Female: en-US-AriaNeural, en-US-JennyNeural.
     "voice": os.getenv("VOICE", "").strip() or "en-US-AndrewNeural",
-    "voice_rate": os.getenv("VOICE_RATE", "").strip() or "+8%",
+    "voice_rate": os.getenv("VOICE_RATE", "").strip() or ("+16%" if BRAINROT else "+8%"),
     "voice_pitch": os.getenv("VOICE_PITCH", "").strip() or "+0Hz",
     # Piper is only the fallback if the neural voice cannot be reached.
     "piper_bin": os.getenv("PIPER_BIN", "piper"),
@@ -81,6 +86,7 @@ CFG = {
 }
 
 TW, TH, FPS = CFG["width"], CFG["height"], CFG["fps"]
+PANEL_H = 1160 if BRAINROT else TH   # story panel height (runner fills the rest)
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 TRENDS_URL = "https://trends.google.com/trending/rss?geo=US"
@@ -108,6 +114,11 @@ TROUBLE = {
     "big": ("BIG TROUBLE", (225, 35, 55)),
     "some": ("SOME TROUBLE", (245, 135, 25)),
     "none": ("NO TROUBLE", (40, 175, 95)),
+}
+TROUBLE_BR = {
+    "big": ("COOKED", (225, 35, 55)),
+    "some": ("MID", (245, 135, 25)),
+    "none": ("LOCKED IN", (40, 175, 95)),
 }
 
 
@@ -563,9 +574,9 @@ def _face_geometry(C, A):
     return (np.stack(corners, 1), np.stack(centres, 1), np.stack(normals, 1))
 
 
-def draw_world(draw, cam, scene, dyn_boxes, RW, RH):
+def draw_world(draw, cam, scene, dyn_boxes, RW, RH, yshift=0.0):
     f = (RH / 2) / cam.tan
-    cx, cy = RW / 2, RH / 2
+    cx, cy = RW / 2, RH / 2 + yshift * RH
 
     # ---- static quads (room shell and wall decoration), in listed order
     if scene._qv is not None:
@@ -720,6 +731,15 @@ def pose_params(pose, emotion, t, u):
         p["bob"] = 0.55 * abs(math.sin(p["lean"]))
         p["al"], p["ar"] = (0.4, 1.6), (0.4, 1.6)
         p["mouth"] = 1.0
+    elif pose == "sprint":
+        sw = math.sin(t * 13)
+        p["ll"], p["lr"] = sw, -sw
+        p["al"], p["ar"] = (-sw, 0.1), (sw, 0.1)
+        p["bob"] = abs(math.cos(t * 13)) * 0.22 + u
+        p["lean"] = 0.2
+        if u > 0.15:                      # mid-jump: tuck legs, arms up
+            p["ll"] = p["lr"] = 0.7
+            p["al"] = p["ar"] = (0.5, 1.3)
     elif pose == "shrug":
         p["al"], p["ar"] = (0.3, 0.75), (0.3, 0.75)
         p["tilt"] = 0.18 + math.sin(t * 2) * 0.04
@@ -1181,6 +1201,128 @@ def get_scene(name):
 
 
 # ---------------------------------------------------------------------
+# ENDLESS-RUNNER PANEL (the "gameplay" half of the split screen)
+# Original blocky runner: dodges trains, jumps barriers, grabs coins.
+# ---------------------------------------------------------------------
+
+ROSTER["runner"] = dict(shirt=(40, 200, 220), pants=(60, 60, 80), skin=(240, 190, 150),
+                        hair=(30, 30, 40), style="short", scale=1.0)
+RUN_LANES = (-3.2, 0.0, 3.2)
+RUN_SPEED = 26.0
+_RUNNER = {}
+
+
+def get_runner_scene():
+    if "s" not in _RUNNER:
+        sc = Scene("runner")
+        sc.bg = ((255, 160, 95), (255, 224, 165)); sc.shadow = (70, 60, 80)
+        sc.quad([(-90, 0, -30), (90, 0, -30), (90, 0, 170), (-90, 0, 170)], (88, 96, 132))
+        sc.quad([(-5.4, 0.01, -30), (5.4, 0.01, -30), (5.4, 0.01, 170), (-5.4, 0.01, 170)], (128, 122, 138))
+        for lx in RUN_LANES:
+            for dx in (-0.8, 0.8):
+                sc.quad([(lx + dx - 0.07, 0.02, -30), (lx + dx + 0.07, 0.02, -30),
+                         (lx + dx + 0.07, 0.02, 170), (lx + dx - 0.07, 0.02, 170)], (195, 200, 210))
+        sc.finalize()
+        _RUNNER["s"] = sc
+    return _RUNNER["s"]
+
+
+def runner_lane_idx(seg):
+    return random.Random(seg * 31 + 5).randrange(3)
+
+
+def runner_lane_x(t):
+    seg = int(t // 1.6)
+    lane = runner_lane_idx(seg)
+    prev = runner_lane_idx(seg - 1) if seg > 0 else 1
+    k = ease(clamp((t - seg * 1.6) / 0.22, 0, 1))
+    return RUN_LANES[prev] + (RUN_LANES[lane] - RUN_LANES[prev]) * k
+
+
+def runner_obstacle(k):
+    tk = 0.9 + k * 0.6
+    seg = int(tk // 1.6)
+    if tk - seg * 1.6 < 0.4:           # never place something mid lane-change
+        return None
+    rl = runner_lane_idx(seg)
+    rng = random.Random(k * 7 + 1)
+    kind = rng.choice(["train", "train", "barrier", "low", "coins", "coins", "coins"])
+    if kind in ("train", "barrier"):
+        lane = rng.choice([i for i in range(3) if i != rl])
+    else:
+        lane = rl
+    return tk, kind, lane, rng.randrange(3)
+
+
+def runner_jump(t):
+    for k in range(max(0, int((t - 1.0) / 0.6) - 1), int((t + 1.0) / 0.6) + 2):
+        ob = runner_obstacle(k)
+        if ob and ob[1] == "low" and abs(t - ob[0]) < 0.4:
+            return 2.2 * math.sin(math.pi * (t - ob[0] + 0.4) / 0.8)
+    return 0.0
+
+
+def runner_boxes(gt):
+    S = RUN_SPEED
+    out = []
+    for i in range(45):                                   # track sleepers
+        z = ((i * 3.0 - gt * S) % 135.0) - 8.0
+        out.append(box((0, 0.06, z), (10.8, 0.12, 0.5), (72, 62, 68)))
+    j0 = int(gt * S / 12.0)
+    for j in range(j0, j0 + 14):                          # side buildings
+        z = j * 12.0 - gt * S
+        for side in (-1, 1):
+            r = random.Random(j * 2 + (1 if side > 0 else 0))
+            h, w = r.uniform(6, 18), r.uniform(5, 8)
+            col = r.choice([(214, 120, 110), (120, 150, 215), (235, 190, 110), (150, 190, 160), (180, 130, 190)])
+            out.append(box((side * (10 + w / 2), h / 2, z + 6), (w, h, 10), col))
+            for wy in range(3, int(h), 3):
+                for wz in (z + 3, z + 8):
+                    out.append(box((side * 9.95, wy, wz), (0.15, 1.2, 1.6), (255, 228, 150), flat=True))
+    kmin = max(0, int((gt - 1.6) / 0.6))
+    kmax = int((gt - 0.9 + 125 / S) / 0.6) + 1
+    for k in range(kmin, kmax + 1):
+        ob = runner_obstacle(k)
+        if not ob:
+            continue
+        tk, kind, lane, ci = ob
+        z = (tk - gt) * S
+        if z < -9 or z > 125:
+            continue
+        x = RUN_LANES[lane]
+        if kind == "train":
+            col = [(220, 60, 60), (60, 120, 220), (240, 170, 40)][ci]
+            out += [box((x, 2.0, z + 4.5), (2.6, 3.4, 9), col),
+                    box((x, 3.9, z + 4.5), (2.4, 0.3, 8.8), mulc(col, 0.7)),
+                    box((x, 2.6, z - 0.02), (2.0, 1.1, 0.1), (200, 235, 250), flat=True),
+                    box((x, 0.9, z - 0.02), (1.6, 0.35, 0.1), (255, 240, 160), flat=True)]
+        elif kind == "barrier":
+            for sx, c in ((-0.87, (30, 30, 36)), (0, (250, 205, 40)), (0.87, (30, 30, 36))):
+                out.append(box((x + sx, 1.5, z), (0.87, 0.55, 0.45), c))
+            for sx in (-1.1, 1.1):
+                out.append(box((x + sx, 0.75, z), (0.25, 1.5, 0.3), (150, 150, 160)))
+        elif kind == "low":
+            out += [box((x, 0.5, z), (2.6, 1.0, 0.8), (240, 140, 45)),
+                    box((x, 0.5, z - 0.41), (2.6, 0.3, 0.05), (255, 255, 255), flat=True)]
+        else:
+            for c in range(5):
+                cy = 1.5 + 0.9 * math.sin(math.pi * c / 4)
+                out.append(box((x, cy, z + c * 1.8), (0.85, 0.85, 0.14), (255, 212, 40),
+                               R=rot_y(gt * 8 + c), flat=True))
+    return out
+
+
+def compose_runner(gt):
+    sc = get_runner_scene()
+    rx = runner_lane_x(gt)
+    bx, origin = build_character("runner", rx, 0.0, 0.0, "sprint", "happy", gt, runner_jump(gt))
+    dyn = {"boxes": runner_boxes(gt) + bx,
+           "decals": [shadow_decal(origin, 1.4, sc.shadow)]}
+    cam = Camera((rx * 0.4, 7.2, -14.0), (rx * 0.25, 1.6, 12.0), fov=62)
+    return sc, cam, dyn
+
+
+# ---------------------------------------------------------------------
 # SHOT COMPOSITION (cast placement + camera)
 # ---------------------------------------------------------------------
 
@@ -1188,7 +1330,7 @@ SLOTS = {1: [0.0], 2: [-2.3, 2.3], 3: [-3.5, 0.0, 3.5]}
 SHOT_DIST = {"close": 21.0, "medium": 26.0, "wide": 31.0}
 
 
-def compose_frame(scene, beat, bi, t, u):
+def compose_frame(scene, beat, bi, t, u, aspect=0.5625, dscale=1.0):
     """Boxes + camera for one frame of a beat. t = secs into beat, u = 0..1."""
     cast = beat["cast"]
     people = [c for c in cast if c["who"] != "pigeon"][:3]
@@ -1230,7 +1372,7 @@ def compose_frame(scene, beat, bi, t, u):
         boxes += scene.dynamic(beat["_t0"] + t)
 
     maxx = max([abs(x) for x in used_x] + [0.0])
-    d = max(SHOT_DIST.get(beat["shot"], 26.0), (maxx + 2.6) / 0.233)
+    d = max(SHOT_DIST.get(beat["shot"], 26.0) * dscale, (maxx + 2.6) / (aspect * 0.414))
     d *= 1.0 - 0.1 * ease(u)                       # slow push-in
     tx = (sum(used_x) / len(used_x)) * 0.5 if used_x else 0.0
     target = np.array([tx, 3.6, 3.4])
@@ -1258,47 +1400,48 @@ def _b(text, scene, shot, cast, chip=None, trouble=None, hl=(), fx="none"):
 DEMO_STORY = {
     "title": "The Fake Sick Day",
     "description": "Jake fakes a sick day and learns the internet never forgets.",
-    "summary": "Jake calls in sick, posts his day at the park, and gets caught.",
+    "summary": "Jake calls in sick, posts his day at the park, and gets cooked.",
     "topic": "fake sick day at work",
-    "tags": ["shorts", "storytime", "funny", "lifelessons"],
+    "tags": ["shorts", "storytime", "brainrot", "funny"],
     "beats": [
-        _b("Jake called in sick, then posted his whole day at the park.", "office", "medium",
+        _b("Bro called in sick, then posted his whole day. He is so cooked.", "office", "medium",
            [("boss", "point", "angry"), ("hero", "shock", "scared")],
-           ("JAKE GOT CAUGHT", "red"), "big", ["sick", "park"], "shake"),
-        _b("It started with a fake cough and a very convincing voice.", "kitchen", "medium",
-           [("hero", "shrug", "smug")], None, None, ["fake", "cough"]),
-        _b("His boss said feel better, and Jake felt amazing.", "kitchen", "medium",
-           [("hero", "celebrate", "happy")], None, None, ["amazing"]),
-        _b("At the park, he took a hundred selfies and posted every single one.", "park", "wide",
+           ("JAKE IS COOKED", "red"), "big", ["cooked"], "shake"),
+        _b("It started with a fake cough. Lowkey the worst acting ever.", "kitchen", "medium",
+           [("hero", "shrug", "smug")], None, None, ["fake cough"]),
+        _b("Boss said feel better, and Jake felt like a total sigma.", "kitchen", "medium",
+           [("hero", "celebrate", "happy")], ("+500 AURA", "green"), None, ["sigma"]),
+        _b("At the park he posted a hundred selfies. No cap, a hundred.", "park", "wide",
            [("hero", "celebrate", "happy"), ("friend", "idle", "happy")],
-           ("SOCIAL MEDIA IS PUBLIC*", "purple"), None, ["selfies", "posted"]),
-        _b("A coworker named Dana saw the posts and showed the entire office.", "store", "wide",
+           ("SOCIAL MEDIA IS PUBLIC*", "purple"), None, ["no cap", "hundred"]),
+        _b("Dana saw the posts and showed the entire office. Chat, is this real?", "store", "wide",
            [("friend", "point", "smug"), ("kid", "shock", "shock")],
-           ("COWORKERS TALK", "purple"), None, ["Dana", "entire", "office"]),
-        _b("Back at work, his boss was holding a printed selfie.", "office", "medium",
-           [("boss", "sit", "angry"), ("hero", "panic", "scared")], None, "big", ["printed", "selfie"], "shake"),
-        _b("Faking a sick day can count as lying to your employer.", "office", "medium",
+           ("COWORKERS TALK", "purple"), None, ["Dana", "real"]),
+        _b("Back at work, his boss held a printed selfie. Only in Ohio.", "office", "medium",
+           [("boss", "sit", "angry"), ("hero", "panic", "scared")],
+           ("-5000 AURA", "red"), "big", ["printed", "Ohio"], "shake"),
+        _b("Faking sick can count as lying to your employer. Brain fully AFK.", "office", "medium",
            [("boss", "point", "angry"), ("hero", "cry", "sad")],
-           ("FAKING SICK = LYING*", "red"), None, ["lying", "employer"]),
-        _b("And many companies can check what you post in public.", "security_room", "medium",
+           ("FAKING SICK = LYING*", "red"), None, ["lying", "AFK"]),
+        _b("And many companies can check what you post in public. Not locked in.", "security_room", "medium",
            [("cop", "sit", "neutral"), ("hero", "shock", "scared")],
-           ("PUBLIC POSTS = EVIDENCE*", "purple"), None, ["check", "public"]),
-        _b("Possible results are a warning, lost pay, or even getting fired.", "office", "medium",
+           ("PUBLIC POSTS = EVIDENCE*", "purple"), None, ["public", "locked"]),
+        _b("Possible results are a warning, lost pay, or getting fired. Straight cooked.", "office", "medium",
            [("boss", "sit", "angry"), ("hero", "cry", "sad")],
-           ("CAN LOSE YOUR JOB*", "red"), "some", ["warning", "fired"]),
-        _b("But here's the twist: Jake actually had real sick days saved.", "hallway", "medium",
+           ("CAN LOSE YOUR JOB*", "red"), "some", ["fired", "cooked"]),
+        _b("But here's the twist: Jake had real sick days saved. Six seven.", "hallway", "medium",
            [("hero", "shrug", "sad"), ("friend", "shrug", "neutral")],
            ("ASK FOR TIME OFF*", "blue"), None, ["twist", "real"]),
-        _b("If he had just asked, his boss probably would have said yes.", "office", "medium",
+        _b("If he just asked, his boss probably would have said yes. Mid decision.", "office", "medium",
            [("boss", "sit", "happy"), ("hero", "shrug", "sad")],
-           None, "none", ["just asked", "yes"]),
+           ("NPC MOVE", "orange"), "none", ["asked", "Mid"]),
         _b("Instead, he got a warning and a very awkward group chat.", "hallway", "wide",
            [("hero", "cry", "sad"), ("friend", "idle", "smug"), ("kid", "idle", "smug")],
-           None, None, ["warning", "awkward"]),
-        _b("Now Jake works Saturdays, and the pigeon knows everything.", "park", "wide",
+           ("-9999 AURA", "red"), None, ["warning", "awkward"]),
+        _b("Now Jake works Saturdays, and the pigeon knows everything. Huss, huss, huss.", "park", "wide",
            [("hero", "idle", "sad"), ("pigeon", "idle", "neutral")], None, None, ["Saturdays", "pigeon"]),
-        _b("Would you call in sick for a day at the park? Tell me below.", "park", "medium",
-           [("hero", "celebrate", "happy"), ("pigeon", "idle", "neutral")], None, None, ["Tell me below"]),
+        _b("Would you fake sick for the park? Comment below, chat.", "park", "medium",
+           [("hero", "celebrate", "happy"), ("pigeon", "idle", "neutral")], None, None, ["comment", "chat"]),
     ],
 }
 
@@ -1377,35 +1520,48 @@ def write_episode(episode_number, state):
     ])
 
     prompt = f"""
-You write viral 40-55 second vertical YouTube Shorts in the "DUMB MOVES" style:
-a narrator tells a funny, relatable story about someone's dumb decision and
-what could realistically happen next, while blocky characters act it out.
+You write viral 35-50 second vertical YouTube Shorts in the modern "brainrot
+storytime" style: a hyped, chaotic, chronically-online narrator tells a funny
+story about someone's dumb decision and what could realistically happen next,
+over a split screen of endless-runner gameplay.
 
-STRUCTURE (14 to 17 beats)
-1. HOOK beat: states the dumb move and that the hero got caught/in trouble.
+STRUCTURE (13 to 16 beats)
+1. HOOK beat: states the dumb move and that the hero is cooked / got caught.
 2. Beats that show how it started, then how it escalated.
 3. Several beats that explain the real-world consequences ("In many places...",
    "Possible results are...", "It can count as..."). Each consequence gets a
-   "chip" (a short tag, 2-4 words, UPPERCASE) that stacks on screen. Add a
-   trailing * to chips that state a general rule.
-4. A TWIST beat ("But here's the twist...") that shows what he should have done.
-5. A funny last beat that ends with a question for the comments.
+   "chip" (a short tag, 2-4 words, UPPERCASE) that stacks on screen.
+4. A TWIST beat ("But here's the twist...") showing what he should have done.
+5. A funny last beat that ends with a question for the comments ("...comment
+   below, chat").
 Topic area for this episode: {area}
 Loose trend inspiration (optional): {twist}
 Do NOT repeat these topics: {json.dumps(recent[-30:])}
 
+VOICE AND SLANG (this is what makes it brainrot)
+- Talk like a chronically online narrator. Work 1-2 slang terms into most
+  lines, never every word, and keep every sentence easy to follow out loud.
+- Slang to mix: cooked, locked in, aura (plus or minus), no cap, fr, lowkey,
+  bro, bruh, chat ("chat, is this real?"), sigma, mid, NPC, slop, brain AFK,
+  "only in Ohio", six seven, huss.
+- Chips are a mix of rule tags with a trailing * ("FAKING SICK = LYING*") and
+  brainrot tags ("-5000 AURA", "+500 AURA", "COOKED", "NPC MOVE", "ONLY IN OHIO").
+- Never use sexual, hateful or insulting slang. No swearing.
+
 RULES
-- The hero has a first name. Spoken lines are 7 to 14 words, punchy, funny,
-  in plain spoken English (it will be read aloud by a voice).
-- Total spoken words: 95 to 150.
-- Be accurate and hedged: say "can", "may", "often", "in many places". Never
-  give medical or legal advice and never claim a specific law or penalty.
+- The hero has a first name. Spoken lines are 7 to 13 words, punchy, funny.
+- Total spoken words: 85 to 140.
+- Be accurate and hedged about real-world rules: say "can", "may", "often",
+  "in many places". Never give medical or legal advice and never claim a
+  specific law or penalty.
 - Family friendly. No real people, brands, or copyrighted characters.
 - Vary scenes, shots, poses and who is on screen. Use "sit" only in office,
   classroom or security_room. A silent pigeon may appear in 2-3 beats.
-- "hl" lists 1-3 important words or short phrases from that beat's text.
-- "trouble" is big, some, or none. Start with big, move to some around the
-  twist, and end with none (or some). Only set it when it changes.
+- "hl" lists 1-3 important or funny words from that beat's text (they pop up
+  big and yellow in the captions).
+- "trouble" is big, some, or none (shown as COOKED, MID, LOCKED IN). Start
+  with big, move to some around the twist, end with none. Only set it when it
+  changes.
 
 Return ONLY valid JSON in exactly this shape:
 {{
@@ -1608,7 +1764,7 @@ def wrap_words(words, fnt, maxw):
     return lines
 
 
-def chunk_words(words, fnt, maxw=860, max_words=7):
+def chunk_words(words, fnt, maxw=780, max_words=7):
     chunks, cur = [], []
     for w in words:
         trial = cur + [w]
@@ -1626,30 +1782,38 @@ def chunk_words(words, fnt, maxw=860, max_words=7):
 
 
 def build_timeline(beats, durations):
-    """Fill beats with start times / durations and build HUD timing."""
+    """Fill beats with start times / durations and build HUD + sound timing."""
+    br = CFG["brainrot"]
     t = 0.0
     trouble = "big"
-    chips = []
-    sfx = []
-    captions = []          # (start, end, [(word, is_highlight)])
+    chips, sfx, captions, punches = [], [], [], []
     fnt = font(72)
 
     for i, (beat, dur) in enumerate(zip(beats, durations)):
         beat["_t0"] = t
-        beat["_dur"] = max(1.7, dur) + (0.45 if i == len(beats) - 1 else 0.0)
+        beat["_dur"] = max(1.3 if br else 1.7, dur) + (0.45 if i == len(beats) - 1 else 0.0)
         speech = max(0.4, dur - 0.2)
+        if br and i == 0:
+            beat["fx"] = "shake"               # chaotic hook frame
 
+        if beat["trouble"] and beat["trouble"] != trouble:
+            if beat["trouble"] == "some":
+                sfx.append((t + 0.05, "horn"))
+            elif beat["trouble"] == "none":
+                sfx.append((t + 0.05, "ding"))
         if beat["trouble"]:
             trouble = beat["trouble"]
         beat["_trouble"] = trouble
 
+        if br and i > 0:
+            sfx.append((max(0.0, t - 0.06), "whoosh"))
         if beat["chip"]:
             ct = t + min(0.5, speech * 0.25)
             chips.append({"text": beat["chip"]["text"],
                           "color": CHIP_COLORS[beat["chip"]["color"]], "t0": ct})
             sfx.append((ct, "pop"))
         if beat["fx"] == "shake" or any(c["pose"] in ("shock", "fall") for c in beat["cast"]):
-            sfx.append((t + 0.02, "thud"))
+            sfx.append((t + 0.02, "boom"))
 
         words = beat["text"].split()
         weights = [max(1, len(re.sub(r"\W", "", w))) + 1 for w in words]
@@ -1668,16 +1832,19 @@ def build_timeline(beats, durations):
 
         idx = 0
         for chunk in chunk_words(words, fnt):
-            start = timed[idx][0]
+            entries = [(w, wkey(w) in hl, timed[idx + j][0]) for j, w in enumerate(chunk)]
             idx += len(chunk)
-            captions.append([start, None,
-                             [(w, wkey(w) in hl) for w in chunk]])
+            captions.append([entries[0][2], None, entries])
+        n_punch = 0
+        for (w, is_hl, ws) in [(timed[k][2], wkey(timed[k][2]) in hl, timed[k][0]) for k in range(len(timed))]:
+            if is_hl and n_punch < 2:
+                punches.append(ws)
+                n_punch += 1
         t += beat["_dur"]
 
-    # each caption stays until the next one starts (or the video ends)
     for k, cap in enumerate(captions):
         cap[1] = captions[k + 1][0] if k + 1 < len(captions) else t
-    return {"total": t, "chips": chips, "sfx": sfx, "captions": captions}
+    return {"total": t, "chips": chips, "sfx": sfx, "captions": captions, "punches": punches}
 
 
 # ---------------------------------------------------------------------
@@ -1692,7 +1859,8 @@ def stroke_text(draw, xy, text, fnt, fill, stroke=6, anchor="la"):
 def build_title_blocks(title, episode):
     blocks = {}
     title = title.upper()
-    for key, (label, colour) in TROUBLE.items():
+    labels = TROUBLE_BR if CFG["brainrot"] else TROUBLE
+    for key, (label, colour) in labels.items():
         img = Image.new("RGBA", (TW, 330), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         stroke_text(d, (64, 6), f"{SERIES_NAME}  •  EP {episode}", font(30),
@@ -1730,30 +1898,41 @@ def build_chip(text, colour):
     return img
 
 
-def build_caption(words):
-    fnt = font(72)
-    maxw = 880
-    plain = [w for w, _ in words]
-    lines = wrap_words(plain, fnt, maxw)
-    if len(lines) > 2:
-        fnt = font(60)
-        lines = wrap_words(plain, fnt, maxw)
-    line_h = int(fnt.size * 1.3)
-    img = Image.new("RGBA", (TW, line_h * len(lines) + 30), (0, 0, 0, 0))
+def build_caption(words, upto):
+    """Kinetic caption: words = [(word, highlight, start)]. Only words up to
+    index `upto` are drawn, but the layout is fixed so nothing jumps around.
+    Highlighted words are bigger and yellow."""
+    base, big = font(76), font(92)
+    maxw = 900
+    space = base.getlength(" ") + 18
+
+    def wf(h):
+        return big if h else base
+
+    lines, cur, curw = [], [], 0.0
+    for i, (w, h, _) in enumerate(words):
+        ww = wf(h).getlength(w)
+        add = ww + (space if cur else 0)
+        if cur and curw + add > maxw:
+            lines.append(cur)
+            cur, curw, add = [], 0.0, ww
+        cur.append((i, w, h, ww))
+        curw += add
+    lines.append(cur)
+
+    line_h = 120
+    img = Image.new("RGBA", (TW, line_h * len(lines) + 40), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    hl_map = {i: h for i, (_, h) in enumerate(words)}
-    space = fnt.getlength(" ") + 16
-    n = 0
     for li, line in enumerate(lines):
-        total = sum(fnt.getlength(x) for x in line) + space * (len(line) - 1)
+        total = sum(x[3] for x in line) + space * (len(line) - 1)
         x = (TW - total) / 2
-        y = li * line_h + fnt.size + 6
-        for w in line:
-            colour = (255, 178, 30) if hl_map.get(n) else (255, 255, 255)
-            d.text((x, y), w, font=fnt, fill=colour, stroke_width=9,
-                   stroke_fill=(16, 16, 28), anchor="ls")
-            x += fnt.getlength(w) + space
-            n += 1
+        y = li * line_h + 100
+        for i, w, h, ww in line:
+            if i <= upto:
+                col = (255, 226, 60) if h else (255, 255, 255)
+                d.text((x, y), w, font=wf(h), fill=col, stroke_width=10,
+                       stroke_fill=(16, 16, 28), anchor="ls")
+            x += ww + space
     return img
 
 
@@ -1768,42 +1947,59 @@ def build_footer():
 
 class Hud:
     def __init__(self, title, episode, timeline):
+        self.br = CFG["brainrot"]
         self.blocks = build_title_blocks(title, episode)
-        self.chip_imgs = [build_chip(c["text"], c["color"]) for c in timeline["chips"]]
         self.chips = timeline["chips"]
+        self.chip_imgs = [build_chip(c["text"], c["color"]) for c in self.chips]
         self.caps = timeline["captions"]
-        self.cap_imgs = [build_caption(c[2]) for c in self.caps]
         self.footer = build_footer()
+        self._cache = {}
+
+    def caption_img(self, k, upto):
+        key = (k, upto)
+        if key not in self._cache:
+            if len(self._cache) > 24:
+                self._cache.clear()
+            self._cache[key] = build_caption(self.caps[k][2], upto)
+        return self._cache[key]
 
     def draw(self, img, gt, trouble):
         block, bottom = self.blocks[trouble]
         img.paste(block, (0, 150), block)
 
-        shown = [i for i, c in enumerate(self.chips) if c["t0"] <= gt][-5:]
-        y = 150 + bottom + 34
+        max_chips, step = (4, 76) if self.br else (5, 86)
+        shown = [i for i, c in enumerate(self.chips) if c["t0"] <= gt][-max_chips:]
+        y = 150 + bottom + (14 if self.br else 34)
         for i in shown:
             chip = self.chip_imgs[i]
             age = gt - self.chips[i]["t0"]
+            cy = y
             if age < 0.32:
                 k = max(0.05, ease_out_back(age / 0.32))
                 chip = chip.resize((max(1, int(chip.width * k)), max(1, int(chip.height * k))),
                                    Image.BILINEAR)
                 cy = y + (100 - chip.height) // 2
-            else:
-                cy = y
             img.paste(chip, ((TW - chip.width) // 2, cy), chip)
-            y += 86
+            y += step
 
-        for k, (s, e, _) in enumerate(self.caps):
+        for k, (s, e, words) in enumerate(self.caps):
             if s <= gt < e:
-                cap = self.cap_imgs[k]
-                age = gt - s
-                if age < 0.1:
-                    sc = 0.92 + 0.08 * (age / 0.1)
+                upto = 0
+                for i, wd in enumerate(words):
+                    if wd[2] <= gt:
+                        upto = i
+                cap = self.caption_img(k, upto)
+                h0 = cap.height
+                age = gt - words[upto][2]
+                if age < 0.12:                      # pop on every new word
+                    sc = 1.0 + 0.14 * (1 - age / 0.12)
                     cap = cap.resize((int(cap.width * sc), int(cap.height * sc)), Image.BILINEAR)
-                img.paste(cap, ((TW - cap.width) // 2, 1180 + (self.cap_imgs[k].height - cap.height) // 2), cap)
+                cy = 1150 if self.br else 1180 + h0 // 2
+                img.paste(cap, ((TW - cap.width) // 2, int(cy - cap.height / 2)), cap)
                 break
-        img.paste(self.footer, (0, 1480), self.footer)
+
+        fy = 1800 if self.br else 1480
+        img.paste(self.footer, (0, fy), self.footer)
 
 
 # ---------------------------------------------------------------------
@@ -1824,9 +2020,50 @@ def scene_background(scene, RW, RH):
     return _BG_CACHE[key]
 
 
+def punch_scale(punches, gt):
+    for p in punches:
+        age = gt - p
+        if 0 <= age < 0.3:
+            return 1.0 + 0.12 * (1 - ease(age / 0.3))
+    return 1.0
+
+
+def zoom_img(img, k):
+    if k <= 1.001:
+        return img
+    w, h = img.size
+    cw, ch = int(w / k), int(h / k)
+    left, top = (w - cw) // 2, (h - ch) // 2
+    return img.crop((left, top, left + cw, top + ch)).resize((w, h), Image.BILINEAR)
+
+
+def glitch(img, px):
+    """RGB-split hit used on the big moments."""
+    a = np.array(img)
+    a[..., 0] = np.roll(a[..., 0], px, axis=1)
+    a[..., 2] = np.roll(a[..., 2], -px, axis=1)
+    return Image.fromarray(a)
+
+
+def runner_frame(gt, RW, RH, out_w, out_h):
+    sc, cam, dyn = compose_runner(gt)
+    img = scene_background(sc, RW, RH).copy()
+    draw_world(ImageDraw.Draw(img), cam, sc, dyn, RW, RH)
+    if (RW, RH) != (out_w, out_h):
+        img = img.resize((out_w, out_h), Image.LANCZOS)
+    d = ImageDraw.Draw(img)
+    stroke_text(d, (38, 26), f"SCORE {int(gt * 173):,}", font(36), (255, 255, 255), 5)
+    stroke_text(d, (out_w - 150, 26), f"{int(gt * 2.7)}", font(36), (255, 226, 60), 5, "ra")
+    d.ellipse((out_w - 128, 30, out_w - 92, 66), fill=(255, 212, 40), outline=(16, 16, 28), width=4)
+    return img
+
+
 def render_blocks(beats, timeline, title, episode, folder):
     ss = max(1.0, CFG["supersample"])
-    RW, RH = int(TW * ss) // 2 * 2, int(TH * ss) // 2 * 2
+    br = CFG["brainrot"]
+    RW = int(TW * ss) // 2 * 2
+    SRH = int(PANEL_H * ss) // 2 * 2
+    RRH = int((TH - PANEL_H) * ss) // 2 * 2
     hud = Hud(title, episode, timeline)
     output = folder / "bg.mp4"
 
@@ -1845,7 +2082,7 @@ def render_blocks(beats, timeline, title, episode, folder):
     try:
         for bi, beat in enumerate(beats):
             scene = get_scene(beat["scene"])
-            bg = scene_background(scene, RW, RH)
+            bg = scene_background(scene, RW, SRH)
             exact += beat["_dur"] * FPS
             end_frame = max(frame_number + 1, round(exact))
             n = end_frame - frame_number
@@ -1853,13 +2090,27 @@ def render_blocks(beats, timeline, title, episode, folder):
             for f in range(n):
                 t = f / FPS
                 u = f / max(1, n - 1)
-                img = bg.copy()
-                draw = ImageDraw.Draw(img)
-                cam, dyn = compose_frame(scene, beat, bi, t, u)
-                draw_world(draw, cam, scene, dyn, RW, RH)
-                if (RW, RH) != (TW, TH):
-                    img = img.resize((TW, TH), Image.LANCZOS)
-                hud.draw(img, beat["_t0"] + t, beat["_trouble"])
+                gt = beat["_t0"] + t
+                simg = bg.copy()
+                cam, dyn = compose_frame(scene, beat, bi, t, u, aspect=RW / SRH,
+                                         dscale=(PANEL_H / TH * 1.12 if br else 1.0))
+                draw_world(ImageDraw.Draw(simg), cam, scene, dyn, RW, SRH,
+                           yshift=0.15 if br else 0.0)
+                if (RW, SRH) != (TW, PANEL_H):
+                    simg = simg.resize((TW, PANEL_H), Image.LANCZOS)
+
+                if br:
+                    if beat["fx"] == "shake" and t < 0.22:
+                        simg = glitch(simg, 14)
+                    simg = zoom_img(simg, punch_scale(timeline["punches"], gt))
+                    img = Image.new("RGB", (TW, TH))
+                    img.paste(simg, (0, 0))
+                    img.paste(runner_frame(gt, RW, RRH, TW, TH - PANEL_H), (0, PANEL_H))
+                    ImageDraw.Draw(img).rectangle((0, PANEL_H - 5, TW, PANEL_H + 5), fill=(14, 14, 24))
+                else:
+                    img = simg
+
+                hud.draw(img, gt, beat["_trouble"])
                 proc.stdin.write(img.tobytes())
 
             frame_number = end_frame
@@ -1884,11 +2135,27 @@ def render_blocks(beats, timeline, title, episode, folder):
 # SOUND EFFECTS + FINAL MIX
 # ---------------------------------------------------------------------
 
+def _sine(freq, dur):
+    return ["-f", "lavfi", "-i", f"sine=frequency={freq}:duration={dur}"]
+
+
+SFX_RECIPES = {
+    "pop": (_sine(1250, 0.1), ["-af", "afade=t=out:st=0.03:d=0.07,volume=0.5"]),
+    "boom": (_sine(58, 0.8) + _sine(117, 0.8),
+             ["-filter_complex", "[0:a][1:a]amix=inputs=2:normalize=0,afade=t=out:st=0.05:d=0.75,volume=2.2"]),
+    "horn": (_sine(466, 0.7) + _sine(587, 0.7) + _sine(698, 0.7),
+             ["-filter_complex", "[0:a][1:a][2:a]amix=inputs=3:normalize=0,tremolo=f=16:d=0.6,"
+                                 "afade=t=out:st=0.4:d=0.3,volume=1.3"]),
+    "ding": (_sine(1568, 0.6), ["-af", "afade=t=out:st=0.05:d=0.55,volume=0.5"]),
+    "whoosh": (["-f", "lavfi", "-i", "anoisesrc=color=pink:duration=0.35:amplitude=0.5"],
+               ["-af", "highpass=f=700,lowpass=f=5000,afade=t=in:d=0.15,afade=t=out:st=0.15:d=0.2,volume=0.6"]),
+}
+
+
 def build_sfx(events, total, folder):
-    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=1250:duration=0.1",
-         "-af", "afade=t=out:st=0.03:d=0.07,volume=0.55", "-ar", "24000", "pop.wav"], cwd=folder)
-    run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=62:duration=0.4",
-         "-af", "afade=t=out:st=0.05:d=0.35,volume=1.6", "-ar", "24000", "thud.wav"], cwd=folder)
+    for kind in sorted({k for _, k in events}):
+        inputs, filt = SFX_RECIPES[kind]
+        run(["ffmpeg", "-y", *inputs, *filt, "-ar", "24000", "-ac", "1", f"{kind}.wav"], cwd=folder)
 
     command = ["ffmpeg", "-y", "-f", "lavfi", "-t", f"{total + 1:.2f}",
                "-i", "anullsrc=r=24000:cl=mono"]
@@ -1957,7 +2224,7 @@ def make_video(index):
                       folder / "video.mp4", total)
 
     for pattern in ("voice_raw_*", "voice_[0-9]*.wav", "voice_list.txt", "bg.mp4",
-                    "pop.wav", "thud.wav", "sfx.wav"):
+                    "pop.wav", "boom.wav", "horn.wav", "ding.wav", "whoosh.wav", "sfx.wav"):
         for path in folder.glob(pattern):
             path.unlink(missing_ok=True)
 
@@ -1969,6 +2236,7 @@ def make_video(index):
         "summary": data.get("summary", ""),
         "tags": data.get("tags", []),
         "duration_sec": round(total, 1),
+        "brainrot_edit": CFG["brainrot"],
         "voice": CFG["voice"] if _TTS_STATE["edge_ok"] else "piper (fallback)",
         "music_used": music,
         "review_checklist": [
