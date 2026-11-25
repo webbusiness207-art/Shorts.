@@ -71,6 +71,12 @@
       "topic": "garden gnome peace treaty",
       "title": "Kevin's Peace Treaty Negotiation",
       "summary": "Kevin attempts to resolve a territorial dispute using garden gnomes, alarming Dave and a local pigeon."
+    },
+    {
+      "ep": 13,
+      "topic": "heavy lifting",
+      "title": "The Weight of Partying",
+      "summary": "A blocky avatar ignores the town party to lift absurd amounts of heavy weights."
     }
   ],
   "topics": [
@@ -93,6 +99,7 @@
     "gravity boots",
     "laser haircut helmet",
     "nhl supermarket skating",
-    "garden gnome peace treaty"
+    "garden gnome peace treaty",
+    "heavy lifting"
   ]
 }
