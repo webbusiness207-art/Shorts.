@@ -107,6 +107,12 @@
       "topic": "restaurants",
       "title": "DRONE DELIVERY DINNER DISASTER",
       "summary": "A chronically online guy uses a tactical drone to pick up takeout and learns about aviation laws the hard way."
+    },
+    {
+      "ep": 19,
+      "topic": "traffic rules",
+      "title": "THE RED LIGHT SPEEDRUN",
+      "summary": "A guy skips every red light and learns about real world traffic laws."
     }
   ],
   "topics": [
@@ -135,6 +141,7 @@
     "school",
     "driving and traffic",
     "work",
-    "restaurants"
+    "restaurants",
+    "traffic rules"
   ]
 }
