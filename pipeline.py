@@ -62,6 +62,9 @@ CFG = {
     # Optional extra "edit" effects (split-screen runner, zoom punches, glitch
     # hits, meme sounds). OFF by default. Set the BRAINROT variable to 1 to try.
     "brainrot": BRAINROT,
+    # "signs" = "When is X too much? Sign 1 of 6..." checklist videos with phone/
+    # note close-ups. FORMAT=story brings back the old COOKED/chip story style.
+    "format": os.getenv("FORMAT", "").strip().lower() or "signs",
     # Natural-sounding Microsoft neural voice (free, no key). Good male
     # options: en-US-AndrewNeural, en-US-BrianNeural, en-US-GuyNeural,
     # en-US-ChristopherNeural. Female: en-US-AriaNeural, en-US-JennyNeural.
@@ -103,6 +106,7 @@ POSES = [
 ]
 EMOTIONS = ["neutral", "happy", "shock", "scared", "angry", "sad", "smug"]
 SHOTS = ["wide", "medium", "close"]
+INSERT_KINDS = ["phone", "note", "alarm", "laptop", "calendar"]
 CHIP_COLORS = {
     "red": (225, 35, 55),
     "purple": (112, 52, 190),
@@ -1438,8 +1442,12 @@ def compose_frame(scene, beat, bi, t, u, aspect=0.5625, dscale=1.0):
 # STORY (validation + generation)
 # ---------------------------------------------------------------------
 
-def _b(text, scene, shot, cast, chip=None, trouble=None, hl=(), fx="none"):
+def _b(text, scene, shot, cast, chip=None, trouble=None, hl=(), fx="none",
+       sign=0, insert=None):
     return {
+        "sign": sign,
+        "insert": ({"kind": insert[0], "title": insert[1], "lines": list(insert[2:])}
+                   if insert else None),
         "text": text, "scene": scene, "shot": shot,
         "cast": [{"who": w, "pose": p, "emotion": e} for w, p, e in cast],
         "chip": {"text": chip[0], "color": chip[1]} if chip else None,
@@ -1448,50 +1456,46 @@ def _b(text, scene, shot, cast, chip=None, trouble=None, hl=(), fx="none"):
 
 
 DEMO_STORY = {
-    "title": "The Fake Sick Day",
-    "description": "Jake fakes a sick day and learns the internet never forgets.",
-    "summary": "Jake calls in sick, posts his day at the park, and gets cooked.",
-    "topic": "fake sick day at work",
-    "tags": ["shorts", "storytime", "brainrot", "funny"],
+    "title": "When Is Living With Your Best Friend Too Much?",
+    "description": "Five signs you and your roommate are basically the same person.",
+    "summary": "Five signs a roommate and a best friend have merged into one person.",
+    "topic": "roommate twins",
+    "tags": ["shorts", "signs", "relatable", "funny"],
     "beats": [
-        _b("Bro called in sick, then posted his whole day. He is so cooked.", "office", "medium",
-           [("boss", "point", "angry"), ("hero", "shock", "scared")],
-           ("JAKE IS COOKED", "red"), "big", ["cooked"], "shake"),
-        _b("It started with a fake cough. Lowkey the worst acting ever.", "kitchen", "medium",
-           [("hero", "shrug", "smug")], None, None, ["fake cough"]),
-        _b("Boss said feel better, and Jake felt like a total sigma.", "kitchen", "medium",
-           [("hero", "celebrate", "happy")], ("+500 AURA", "green"), None, ["sigma"]),
-        _b("At the park he posted a hundred selfies. No cap, a hundred.", "park", "wide",
-           [("hero", "celebrate", "happy"), ("friend", "idle", "happy")],
-           ("SOCIAL MEDIA IS PUBLIC*", "purple"), None, ["no cap", "hundred"]),
-        _b("Dana saw the posts and showed the entire office. Chat, is this real?", "store", "wide",
-           [("friend", "point", "smug"), ("kid", "shock", "shock")],
-           ("COWORKERS TALK", "purple"), None, ["Dana", "real"]),
-        _b("Back at work, his boss held a printed selfie. Only in Ohio.", "office", "medium",
-           [("boss", "sit", "angry"), ("hero", "panic", "scared")],
-           ("-5000 AURA", "red"), "big", ["printed", "Ohio"], "shake"),
-        _b("Faking sick can count as lying to your employer. Brain fully AFK.", "office", "medium",
-           [("boss", "point", "angry"), ("hero", "cry", "sad")],
-           ("FAKING SICK = LYING*", "red"), None, ["lying", "AFK"]),
-        _b("And many companies can check what you post in public. Not locked in.", "security_room", "medium",
-           [("cop", "sit", "neutral"), ("hero", "shock", "scared")],
-           ("PUBLIC POSTS = EVIDENCE*", "purple"), None, ["public", "locked"]),
-        _b("Possible results are a warning, lost pay, or getting fired. Straight cooked.", "office", "medium",
-           [("boss", "sit", "angry"), ("hero", "cry", "sad")],
-           ("CAN LOSE YOUR JOB*", "red"), "some", ["fired", "cooked"]),
-        _b("But here's the twist: Jake had real sick days saved. Six seven.", "hallway", "medium",
-           [("hero", "shrug", "sad"), ("friend", "shrug", "neutral")],
-           ("ASK FOR TIME OFF*", "blue"), None, ["twist", "real"]),
-        _b("If he just asked, his boss probably would have said yes. Mid decision.", "office", "medium",
-           [("boss", "sit", "happy"), ("hero", "shrug", "sad")],
-           ("NPC MOVE", "orange"), "none", ["asked", "Mid"]),
-        _b("Instead, he got a warning and a very awkward group chat.", "hallway", "wide",
-           [("hero", "cry", "sad"), ("friend", "idle", "smug"), ("kid", "idle", "smug")],
-           ("-9999 AURA", "red"), None, ["warning", "awkward"]),
-        _b("Now Jake works Saturdays, and the pigeon knows everything. Huss, huss, huss.", "park", "wide",
-           [("hero", "idle", "sad"), ("pigeon", "idle", "neutral")], None, None, ["Saturdays", "pigeon"]),
-        _b("Would you fake sick for the park? Comment below, chat.", "park", "medium",
-           [("hero", "celebrate", "happy"), ("pigeon", "idle", "neutral")], None, None, ["comment", "chat"]),
+        _b("When is living with your best friend too much? Chat, here are five signs.",
+           "kitchen", "medium", [("hero", "shrug", "shock"), ("friend", "idle", "smug")],
+           hl=["too much", "five"], fx="shake"),
+        _b("Sign one: you both wake up at the exact same time. Every single day.",
+           "kitchen", "medium", [("hero", "idle", "sad"), ("friend", "idle", "sad")],
+           hl=["Sign one", "same time"], sign=1),
+        _b("Same alarm, same snooze, same sad face. Lowkey scary.",
+           "kitchen", "close", [("hero", "idle", "sad")], hl=["snooze", "scary"],
+           insert=("alarm", "7:00", "BOTH PHONES RINGING")),
+        _b("Sign two: you share one brain. You say the same thing, fr fr.",
+           "hallway", "medium", [("hero", "point", "shock"), ("friend", "point", "shock")],
+           hl=["Sign two", "one brain"], sign=2),
+        _b("You text each other the same message at the same time.",
+           "hallway", "close", [("hero", "idle", "shock")], hl=["same message"],
+           insert=("phone", "Derek", "did u see that", "omg yes!!", "wait we said it together")),
+        _b("Sign three: you split the groceries without ever talking about it.",
+           "store", "wide", [("hero", "idle", "smug"), ("friend", "idle", "smug")],
+           hl=["Sign three", "groceries"], sign=3),
+        _b("One list, two handwritings. No cap.",
+           "store", "close", [("friend", "idle", "happy")], hl=["No cap"],
+           insert=("note", "WE NEED", "milk", "chips", "more chips")),
+        _b("Sign four: your friends say your names as one word.",
+           "park", "wide", [("hero", "celebrate", "happy"), ("friend", "celebrate", "happy"),
+                            ("kid", "shrug", "neutral")],
+           hl=["Sign four", "one word"], sign=4),
+        _b("Sign five: it's Sunday and nobody planned anything. Both cooked.",
+           "kitchen", "medium", [("hero", "cry", "sad"), ("friend", "cry", "sad")],
+           hl=["Sign five", "cooked"], sign=5),
+        _b("Zero plans, full aura loss. Only in Ohio.",
+           "kitchen", "close", [("hero", "idle", "sad")], hl=["aura", "Ohio"],
+           insert=("calendar", "SUNDAY", "12", "NO PLANS")),
+        _b("Hit three of these and you two are basically one NPC. Share this with your roommate.",
+           "park", "medium", [("hero", "celebrate", "happy"), ("friend", "celebrate", "happy")],
+           hl=["three", "NPC", "Share"]),
     ],
 }
 
@@ -1548,9 +1552,24 @@ def clean_beat(beat):
     hl = beat.get("hl") or []
     hl = [str(x) for x in hl][:6] if isinstance(hl, list) else []
 
+    try:
+        sign = max(0, min(9, int(beat.get("sign") or 0)))
+    except (TypeError, ValueError):
+        sign = 0
+    insert = None
+    raw = beat.get("insert")
+    if isinstance(raw, dict) and raw.get("kind") in INSERT_KINDS:
+        lines = raw.get("lines") or []
+        lines = [re.sub(r"\s+", " ", str(x)).strip()[:34] for x in lines
+                 if str(x).strip()][:4] if isinstance(lines, list) else []
+        insert = {"kind": raw["kind"],
+                  "title": re.sub(r"\s+", " ", str(raw.get("title", ""))).strip()[:28],
+                  "lines": lines}
+
     return {
         "text": text, "scene": scene, "shot": shot, "cast": cast,
         "chip": chip, "trouble": trouble, "hl": hl, "fx": fx,
+        "sign": sign, "insert": insert,
     }
 
 
@@ -1568,6 +1587,71 @@ def write_episode(episode_number, state):
         "neighbors", "airports and travel", "restaurants", "sports", "online gaming",
         "borrowing things", "public transport", "a group chat", "a family trip",
     ])
+
+    signs_prompt = f"""
+You write viral 35-50 second vertical Shorts in the "SIGNS" listicle style: a
+relatable hook question, then a numbered checklist of signs, each shown with a
+cartoon scene or a close-up of a phone text, sticky note, alarm, laptop or
+calendar. It is fast, funny, a little chaotic, and speaks straight to "you".
+
+Topic area for this episode: {area}
+Loose trend inspiration (optional): {twist}
+Do NOT repeat these topics: {json.dumps(recent[-30:])}
+
+STRUCTURE (11 to 15 beats)
+1. HOOK beat (sign 0): a question the viewer wants answered, like "When is
+   living with your best friend too much?" or "Signs your group chat is
+   running your life." End it with "here are five signs".
+2. For each sign number k from 1 to N (N is 4, 5 or 6) write a beat that STARTS
+   with "Sign one:", "Sign two:" and so on, and set "sign": k on that beat.
+   Directly after it, add a short follow-up beat (sign 0) that makes the sign
+   funnier. Give at least 3 of those follow-ups an "insert" close-up.
+3. The LAST sign is the twist or funniest one.
+4. FINAL beat (sign 0): a punchline plus a share line ("Share this with the
+   friend who...").
+
+VOICE
+- Second person: "you", "your". Relatable everyday situations the viewer has
+  lived. Light modern slang (cooked, no cap, fr, aura, NPC, lowkey, locked in,
+  only in Ohio, sigma, mid), one or two per beat, never forced.
+- Spoken lines are 6 to 14 words. Total spoken words 90 to 160.
+- Family friendly, no swearing, no real people, no brands, no advice.
+- "hl" lists 1-3 words from the beat that pop in the captions.
+
+INSERT CLOSE-UPS (the "insert" field, only on follow-up beats)
+- {{"kind":"phone","title":"Derek","lines":["did u see that","omg yes","same brain"]}}
+  = a text chat. Lines alternate: incoming, outgoing, incoming...
+- {{"kind":"note","title":"WE NEED","lines":["milk","chips"]}}   = sticky note
+- {{"kind":"alarm","title":"7:00","lines":["BOTH PHONES RINGING"]}}
+- {{"kind":"laptop","title":"Essay","lines":["Chapter one is","pure panic"]}}
+- {{"kind":"calendar","title":"FRIDAY","lines":["13","NO PLANS"]}}
+Keep every title and line short (under 30 characters).
+
+Return ONLY valid JSON in exactly this shape:
+{{
+ "title": "WHEN IS LIVING WITH YOUR BEST FRIEND TOO MUCH?",
+ "description": "one sentence",
+ "summary": "one sentence plot summary",
+ "topic": "short topic label",
+ "tags": ["shorts","relatable","funny"],
+ "beats": [
+  {{"text": "Sign one: you both wake up at the same time.",
+    "scene": "kitchen", "shot": "medium",
+    "cast": [{{"who":"hero","pose":"idle","emotion":"sad"}},
+             {{"who":"friend","pose":"idle","emotion":"sad"}}],
+    "hl": ["Sign one","same time"], "fx": "none", "sign": 1, "insert": null}}
+ ]
+}}
+Use only these values:
+scene: {SCENES}
+shot: {SHOTS}
+who: {WHO}  (hero = "you")
+pose: {POSES}
+emotion: {EMOTIONS}
+fx: none or shake (only on the hook beat)
+Use "sit" only in office, classroom or security_room. Vary scenes and who is on
+screen. Use at most 3 people per beat.
+"""
 
     prompt = f"""
 You write viral 35-50 second vertical YouTube Shorts in the modern "brainrot
@@ -1653,6 +1737,9 @@ chip color: {sorted(CHIP_COLORS)}
 fx: none or shake
 """
 
+    use_signs = CFG["format"] != "story"
+    if use_signs:
+        prompt = signs_prompt
     last_error = None
     for attempt in range(4):
         try:
@@ -1663,7 +1750,10 @@ fx: none or shake
 
             if not 8 <= len(beats) <= 20 or not 60 <= words <= 190:
                 raise ValueError(f"Story length outside limits: {len(beats)} beats, {words} words")
-            if chips < 2:
+            if use_signs:
+                if max([x["sign"] for x in beats] + [0]) < 3:
+                    raise ValueError("Signs video needs at least 3 numbered signs.")
+            elif chips < 2:
                 raise ValueError("Story needs at least 2 consequence chips.")
 
             data["beats"] = beats
@@ -1874,6 +1964,9 @@ def build_timeline(beats, durations):
     trouble = "big"
     chips, sfx, captions, punches = [], [], [], []
     fnt = font(72)
+    n_signs = max([b.get("sign", 0) for b in beats] + [0])
+    signs_mode = n_signs >= 3
+    sign_t, cur_sign = [], 0
 
     for i, (beat, dur) in enumerate(zip(beats, durations)):
         beat["_t0"] = t
@@ -1885,6 +1978,17 @@ def build_timeline(beats, durations):
         if br and i == 0:
             beat["fx"] = "shake"               # chaotic hook frame
 
+        if signs_mode:
+            if beat.get("sign", 0) > cur_sign:
+                cur_sign = beat["sign"]
+                sign_t.append((t, cur_sign))
+                sfx.append((t + 0.05, "ding"))
+            beat["_sign"] = cur_sign
+            if beat.get("insert"):
+                sfx.append((t + 0.02, "whoosh"))
+                sfx.append((t + 0.3, "pop"))
+            beat["chip"] = None
+            beat["trouble"] = None
         if beat["trouble"] and beat["trouble"] != trouble:
             if beat["trouble"] == "some":
                 sfx.append((t + 0.05, "horn"))
@@ -1933,7 +2037,8 @@ def build_timeline(beats, durations):
 
     for k, cap in enumerate(captions):
         cap[1] = captions[k + 1][0] if k + 1 < len(captions) else t
-    return {"total": t, "chips": chips, "sfx": sfx, "captions": captions, "punches": punches}
+    return {"total": t, "chips": chips, "sfx": sfx, "captions": captions, "punches": punches,
+            "signs": n_signs if signs_mode else 0, "sign_t": sign_t}
 
 
 # ---------------------------------------------------------------------
@@ -2028,15 +2133,248 @@ def build_caption(words, upto):
 def build_footer():
     img = Image.new("RGBA", (TW, 60), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.text((TW / 2, 30), "General info only, not advice. Rules vary by place.",
+    d.text((TW / 2, 30), "Fictional comedy for fun. Not advice.",
            font=font(26), fill=(235, 235, 240), anchor="mm",
            stroke_width=4, stroke_fill=(16, 16, 28))
+    return img
+
+
+def build_sign_bars(title, n):
+    """Header images: k=0 shows the hook question, k>=1 shows 'SIGN k OF n'."""
+    bars = []
+    for k in range(n + 1):
+        img = Image.new("RGBA", (TW, 330), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        if k == 0:
+            fs = 64
+            lines = _wrap_text(title, font(fs), 800)
+            while len(lines) > 3 and fs > 44:
+                fs -= 6
+                lines = _wrap_text(title, font(fs), 800)
+            lh = int(fs * 1.22)
+            h = lh * len(lines) + 44
+            d.rounded_rectangle((70, 40, TW - 70, 40 + h), radius=36,
+                                fill=(46, 184, 96), outline=(255, 255, 255), width=6)
+            for i, line in enumerate(lines):
+                stroke_text(d, (TW // 2, 40 + 22 + lh * i + lh // 2), line, font(fs),
+                            (255, 255, 255), 5, "mm")
+        bw, gap = min(96, (TW - 160) // n - 12), 12
+        total = n * bw + (n - 1) * gap
+        x0 = (TW - total) // 2
+        by = 8 if k == 0 else 12
+        if k == 0:
+            by = 40 + 0
+        for i in range(n):
+            x = x0 + i * (bw + gap)
+            if k == 0:
+                continue
+            done = i < k
+            d.rounded_rectangle((x, by, x + bw, by + 38), radius=10,
+                                fill=(46, 184, 96) if done else (255, 255, 255),
+                                outline=(16, 16, 28), width=4)
+            if done:
+                cx, cy = x + bw // 2, by + 19
+                d.line([(cx - 14, cy), (cx - 4, cy + 10), (cx + 16, cy - 10)],
+                       fill=(255, 255, 255), width=7, joint="curve")
+        if k > 0:
+            label = f"SIGN {k} OF {n}"
+            fnt = font(58)
+            w = int(fnt.getlength(label)) + 90
+            d.rounded_rectangle(((TW - w) // 2, by + 62, (TW + w) // 2, by + 62 + 88),
+                                radius=30, fill=(252, 250, 236), outline=(16, 16, 28), width=5)
+            d.text((TW // 2, by + 62 + 46), label, font=fnt, fill=(24, 32, 44), anchor="mm")
+        bars.append(img)
+    return bars
+
+
+def _wrap_text(text, fnt, maxw):
+    words, lines, cur = str(text).split(), [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if cur and fnt.getlength(trial) > maxw:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+INSERT_BG = [(190, 226, 156), (168, 204, 236), (250, 214, 150), (240, 186, 202),
+             (204, 192, 236), (255, 226, 140)]
+_STRIPES = {}
+
+
+def _insert_bg(idx):
+    col = INSERT_BG[idx % len(INSERT_BG)]
+    if col not in _STRIPES:
+        img = Image.new("RGB", (TW, TH), col)
+        d = ImageDraw.Draw(img)
+        light = tuple(min(255, c + 16) for c in col)
+        for x in range(-TH, TW, 220):
+            d.polygon([(x, TH), (x + 90, TH), (x + 90 + TH, 0), (x + TH, 0)], fill=light)
+        _STRIPES[col] = img
+    return _STRIPES[col].copy()
+
+
+def _card_phone(ins, t, dur):
+    cv = Image.new("RGBA", (900, 660), (0, 0, 0, 0))
+    d = ImageDraw.Draw(cv)
+    d.rounded_rectangle((250, 0, 650, 660), radius=56, fill=(28, 30, 46))
+    d.rounded_rectangle((264, 14, 636, 646), radius=44, fill=(250, 250, 252))
+    d.rounded_rectangle((264, 14, 636, 118), radius=44, fill=(236, 238, 246))
+    d.rectangle((264, 70, 636, 118), fill=(236, 238, 246))
+    d.ellipse((284, 34, 344, 94), fill=(222, 70, 80))
+    name = ins["title"] or "Chat"
+    d.text((314, 64), name[:1].upper(), font=font(34), fill=(255, 255, 255), anchor="mm")
+    d.text((362, 64), name, font=font(34), fill=(30, 34, 50), anchor="lm")
+    lines = ins["lines"] or ["..."]
+    n = len(lines)
+    step = min(0.8, max(0.3, dur * 0.6 / n))
+    y = 138
+    fnt = font(28)
+    for i, line in enumerate(lines):
+        r = 0.3 + i * step
+        wrapped = _wrap_text(line, fnt, 270)
+        bh = 24 + 36 * len(wrapped)
+        mine = i % 2 == 1
+        if t < r:
+            if t > r - 0.4 and not mine:
+                d.rounded_rectangle((284, y, 384, y + 50), radius=25, fill=(230, 232, 238))
+                for j in range(3):
+                    dy = abs(math.sin(t * 9 + j)) * 6
+                    d.ellipse((304 + j * 28, y + 21 - dy, 316 + j * 28, y + 33 - dy),
+                              fill=(130, 134, 150))
+            break
+        bw = int(max(fnt.getlength(x) for x in wrapped)) + 36
+        if mine:
+            x0 = 616 - bw
+            d.rounded_rectangle((x0, y, 616, y + bh), radius=26, fill=(40, 105, 225))
+            col = (255, 255, 255)
+        else:
+            x0 = 284
+            d.rounded_rectangle((x0, y, x0 + bw, y + bh), radius=26, fill=(230, 232, 238))
+            col = (30, 34, 50)
+        for j, wl in enumerate(wrapped):
+            d.text((x0 + 18, y + 12 + 36 * j), wl, font=fnt, fill=col)
+        y += bh + 18
+    return cv
+
+
+def _card_note(ins, t, dur):
+    cv = Image.new("RGBA", (900, 660), (0, 0, 0, 0))
+    d = ImageDraw.Draw(cv)
+    x0, y0, sz = 170, 40, 560
+    d.rectangle((x0 + 12, y0 + 16, x0 + sz + 12, y0 + sz + 16), fill=(0, 0, 0, 60))
+    d.rectangle((x0, y0, x0 + sz, y0 + sz), fill=(255, 226, 92))
+    d.rectangle((x0 + 190, y0 - 22, x0 + 370, y0 + 34), fill=(255, 255, 255, 170))
+    y = y0 + 70
+    for ln in _wrap_text(ins["title"], font(66), sz - 80)[:2]:
+        d.text((x0 + 40, y), ln, font=font(66), fill=(40, 36, 50))
+        y += 82
+    y += 10
+    k = max(1, len(ins["lines"]))
+    for i, line in enumerate(ins["lines"]):
+        if t < 0.3 + i * min(0.6, dur * 0.5 / k):
+            break
+        d.text((x0 + 40, y), "- " + line, font=font(46), fill=(60, 52, 70))
+        y += 64
+    return cv.rotate(-4, resample=Image.BICUBIC)
+
+
+def _card_alarm(ins, t, dur):
+    cv = Image.new("RGBA", (900, 660), (0, 0, 0, 0))
+    d = ImageDraw.Draw(cv)
+    d.rounded_rectangle((240, 0, 660, 660), radius=60, fill=(22, 24, 44))
+    d.text((450, 250), ins["title"] or "7:00", font=font(140), fill=(255, 255, 255), anchor="mm")
+    cx, cy = 450, 440
+    d.ellipse((cx - 56, cy - 62, cx + 56, cy + 40), fill=(255, 205, 50))
+    d.rectangle((cx - 66, cy + 26, cx + 66, cy + 46), fill=(255, 205, 50))
+    d.ellipse((cx - 14, cy + 44, cx + 14, cy + 72), fill=(255, 205, 50))
+    a = int(120 + 120 * abs(math.sin(t * 14)))
+    for sx in (-1, 1):
+        for r in (84, 112):
+            bx = cx + sx * r
+            d.arc((bx - 26, cy - 60, bx + 26, cy + 10), 270 if sx > 0 else 90,
+                  90 if sx > 0 else 270, fill=(255, 205, 50, a), width=8)
+    if ins["lines"]:
+        d.rounded_rectangle((270, 560, 630, 625), radius=30, fill=(122, 74, 210))
+        d.text((450, 593), ins["lines"][0][:24], font=font(26), fill=(255, 255, 255), anchor="mm")
+    return cv.rotate(math.sin(t * 30) * 3.0, resample=Image.BICUBIC)
+
+
+def _card_laptop(ins, t, dur):
+    cv = Image.new("RGBA", (900, 660), (0, 0, 0, 0))
+    d = ImageDraw.Draw(cv)
+    d.rounded_rectangle((60, 20, 840, 540), radius=32, fill=(40, 44, 60))
+    d.rounded_rectangle((84, 44, 816, 516), radius=14, fill=(250, 250, 252))
+    d.rectangle((84, 44, 816, 100), fill=(226, 230, 242))
+    d.text((112, 72), ins["title"] or "Document", font=font(32), fill=(30, 34, 50), anchor="lm")
+    for i, c in enumerate(((235, 90, 90), (240, 190, 60), (80, 190, 110))):
+        d.ellipse((730 + i * 26, 62, 748 + i * 26, 80), fill=c)
+    d.rounded_rectangle((30, 548, 870, 590), radius=20, fill=(176, 182, 200))
+    text = " ".join(ins["lines"]) or "..."
+    shown = int(len(text) * clamp(t / max(0.8, dur * 0.7), 0, 1))
+    y, fnt, left = 130, font(40), text[:shown]
+    for ln in _wrap_text(left + ("|" if int(t * 3) % 2 == 0 else " "), fnt, 680)[:7]:
+        d.text((114, y), ln, font=fnt, fill=(30, 34, 50))
+        y += 56
+    return cv
+
+
+def _card_calendar(ins, t, dur):
+    cv = Image.new("RGBA", (900, 660), (0, 0, 0, 0))
+    d = ImageDraw.Draw(cv)
+    d.rounded_rectangle((170, 0, 730, 640), radius=44, fill=(255, 255, 255))
+    d.rounded_rectangle((170, 0, 730, 150), radius=44, fill=(226, 52, 62))
+    d.rectangle((170, 90, 730, 150), fill=(226, 52, 62))
+    d.text((450, 78), ins["title"][:12] or "FRIDAY", font=font(70), fill=(255, 255, 255), anchor="mm")
+    day = ins["lines"][0] if ins["lines"] else ""
+    d.text((450, 340), day[:3], font=font(240), fill=(30, 34, 50), anchor="mm")
+    if len(ins["lines"]) > 1 and t > 0.5:
+        k = ease_out_back(min(1.0, (t - 0.5) / 0.3))
+        txt = ins["lines"][1][:16]
+        w = int(font(46).getlength(txt)) + 60
+        lay = Image.new("RGBA", (w + 20, 110), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(lay)
+        ld.rounded_rectangle((8, 8, w + 12, 100), radius=22, outline=(226, 52, 62), width=8,
+                             fill=(255, 255, 255, 230))
+        ld.text(((w + 20) // 2, 54), txt, font=font(46), fill=(226, 52, 62), anchor="mm")
+        lay = lay.rotate(-6, expand=True, resample=Image.BICUBIC)
+        kk = max(0.05, k)
+        lay = lay.resize((max(1, int(lay.width * kk)), max(1, int(lay.height * kk))))
+        cv.paste(lay, (450 - lay.width // 2, 520 - lay.height // 2), lay)
+    return cv
+
+
+_CARDS = {"phone": _card_phone, "note": _card_note, "alarm": _card_alarm,
+          "laptop": _card_laptop, "calendar": _card_calendar}
+
+
+def insert_frame(ins, t, dur, idx):
+    """Full-frame close-up (phone chat, sticky note, alarm...) on a pastel bg."""
+    img = _insert_bg(idx)
+    cv = _CARDS[ins["kind"]](ins, t, dur)
+    k = max(0.05, ease_out_back(min(1.0, t / 0.35)))
+    sc = (1.4 if ins['kind'] == 'phone' else 1.15) * k
+    cv = cv.resize((max(1, int(cv.width * sc)), max(1, int(cv.height * sc))), Image.BILINEAR)
+    cx, cy = TW // 2, 800 + int(math.sin(t * 2.2) * 9)
+    sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(sh).ellipse((cx - int(cv.width * 0.32), cy + int(cv.height * 0.42),
+                                cx + int(cv.width * 0.32), cy + int(cv.height * 0.5)),
+                               fill=(0, 0, 0, 55))
+    img.paste(sh, (0, 0), sh)
+    img.paste(cv, (cx - cv.width // 2, cy - cv.height // 2), cv)
     return img
 
 
 class Hud:
     def __init__(self, title, episode, timeline):
         self.br = CFG["brainrot"]
+        self.n_signs = timeline.get("signs", 0)
+        self.sign_t = timeline.get("sign_t", [])
+        self.sign_bars = build_sign_bars(title, self.n_signs) if self.n_signs else None
         self.blocks = build_title_blocks(title, episode)
         self.chips = timeline["chips"]
         self.chip_imgs = [build_chip(c["text"], c["color"]) for c in self.chips]
@@ -2053,6 +2391,22 @@ class Hud:
         return self._cache[key]
 
     def draw(self, img, gt, trouble):
+        if self.sign_bars:
+            k, t0 = 0, 0.0
+            for st, kk in self.sign_t:
+                if st <= gt:
+                    k, t0 = kk, st
+            bar = self.sign_bars[min(k, self.n_signs)]
+            age = gt - t0
+            if k > 0 and age < 0.3:
+                sc = max(0.05, ease_out_back(age / 0.3))
+                bar = bar.resize((max(1, int(bar.width * sc)), max(1, int(bar.height * sc))),
+                                 Image.BILINEAR)
+            img.paste(bar, ((TW - bar.width) // 2, 150 + (330 - bar.height) // 2), bar)
+            bottom = 330
+            self._draw_caption(img, gt)
+            img.paste(self.footer, (0, 1760), self.footer)
+            return
         block, bottom = self.blocks[trouble]
         img.paste(block, (0, 150), block)
 
@@ -2071,6 +2425,12 @@ class Hud:
             img.paste(chip, ((TW - chip.width) // 2, cy), chip)
             y += step
 
+        self._draw_caption(img, gt)
+
+        fy = 1800 if self.br else 1480
+        img.paste(self.footer, (0, fy), self.footer)
+
+    def _draw_caption(self, img, gt):
         for k, (s, e, words) in enumerate(self.caps):
             if s <= gt < e:
                 upto = 0
@@ -2084,389 +2444,4 @@ class Hud:
                 age = gt - words[upto][2]
                 if self.br and age < 0.12:                      # pop on every new word
                     sc = 1.0 + 0.14 * (1 - age / 0.12)
-                    cap = cap.resize((int(cap.width * sc), int(cap.height * sc)), Image.BILINEAR)
-                cy = 1150 if self.br else 1180 + h0 // 2
-                img.paste(cap, ((TW - cap.width) // 2, int(cy - cap.height / 2)), cap)
-                break
-
-        fy = 1800 if self.br else 1480
-        img.paste(self.footer, (0, fy), self.footer)
-
-
-# ---------------------------------------------------------------------
-# VIDEO RENDER
-# ---------------------------------------------------------------------
-
-_BG_CACHE = {}
-
-
-def scene_background(scene, RW, RH):
-    key = (scene.name, RW, RH)
-    if key not in _BG_CACHE:
-        top, bot = np.array(scene.bg[0], float), np.array(scene.bg[1], float)
-        k = np.linspace(0, 1, RH)[:, None]
-        col = (top + (bot - top) * k).astype(np.uint8)
-        arr = np.repeat(col[:, None, :], RW, axis=1)
-        _BG_CACHE[key] = Image.fromarray(arr, "RGB")
-    return _BG_CACHE[key]
-
-
-def punch_scale(punches, gt):
-    for p in punches:
-        age = gt - p
-        if 0 <= age < 0.3:
-            return 1.0 + 0.12 * (1 - ease(age / 0.3))
-    return 1.0
-
-
-def zoom_img(img, k):
-    if k <= 1.001:
-        return img
-    w, h = img.size
-    cw, ch = int(w / k), int(h / k)
-    left, top = (w - cw) // 2, (h - ch) // 2
-    return img.crop((left, top, left + cw, top + ch)).resize((w, h), Image.BILINEAR)
-
-
-def glitch(img, px):
-    """RGB-split hit used on the big moments."""
-    a = np.array(img)
-    a[..., 0] = np.roll(a[..., 0], px, axis=1)
-    a[..., 2] = np.roll(a[..., 2], -px, axis=1)
-    return Image.fromarray(a)
-
-
-def runner_frame(gt, RW, RH, out_w, out_h):
-    sc, cam, dyn = compose_runner(gt)
-    img = scene_background(sc, RW, RH).copy()
-    draw_world(ImageDraw.Draw(img), cam, sc, dyn, RW, RH)
-    if (RW, RH) != (out_w, out_h):
-        img = img.resize((out_w, out_h), Image.LANCZOS)
-    d = ImageDraw.Draw(img)
-    stroke_text(d, (38, 26), f"SCORE {int(gt * 173):,}", font(36), (255, 255, 255), 5)
-    stroke_text(d, (out_w - 150, 26), f"{int(gt * 2.7)}", font(36), (255, 226, 60), 5, "ra")
-    d.ellipse((out_w - 128, 30, out_w - 92, 66), fill=(255, 212, 40), outline=(16, 16, 28), width=4)
-    return img
-
-
-def render_blocks(beats, timeline, title, episode, folder):
-    ss = max(1.0, CFG["supersample"])
-    br = CFG["brainrot"]
-    RW = int(TW * ss) // 2 * 2
-    SRH = int(PANEL_H * ss) // 2 * 2
-    RRH = int((TH - PANEL_H) * ss) // 2 * 2
-    hud = Hud(title, episode, timeline)
-    output = folder / "bg.mp4"
-
-    command = [
-        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{TW}x{TH}", "-r", str(FPS), "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", str(output),
-    ]
-    proc = subprocess.Popen(command, stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    frame_number = 0
-    exact = 0.0
-    started = time.time()
-    try:
-        for bi, beat in enumerate(beats):
-            scene = get_scene(beat["scene"])
-            bg = scene_background(scene, RW, SRH)
-            exact += beat["_dur"] * FPS
-            end_frame = max(frame_number + 1, round(exact))
-            n = end_frame - frame_number
-
-            for f in range(n):
-                t = f / FPS
-                u = f / max(1, n - 1)
-                gt = beat["_t0"] + t
-                simg = bg.copy()
-                cam, dyn = compose_frame(scene, beat, bi, t, u, aspect=RW / SRH,
-                                         dscale=(PANEL_H / TH * 1.12 if br else 1.0))
-                draw_world(ImageDraw.Draw(simg), cam, scene, dyn, RW, SRH,
-                           yshift=0.15 if br else 0.0)
-                if (RW, SRH) != (TW, PANEL_H):
-                    simg = simg.resize((TW, PANEL_H), Image.LANCZOS)
-
-                if br:
-                    if beat["fx"] == "shake" and t < 0.22:
-                        simg = glitch(simg, 14)
-                    simg = zoom_img(simg, punch_scale(timeline["punches"], gt))
-                    img = Image.new("RGB", (TW, TH))
-                    img.paste(simg, (0, 0))
-                    img.paste(runner_frame(gt, RW, RRH, TW, TH - PANEL_H), (0, PANEL_H))
-                    ImageDraw.Draw(img).rectangle((0, PANEL_H - 5, TW, PANEL_H + 5), fill=(14, 14, 24))
-                else:
-                    img = simg
-
-                hud.draw(img, gt, beat["_trouble"])
-                proc.stdin.write(img.tobytes())
-
-            frame_number = end_frame
-            if bi % 4 == 3:
-                print(f"  rendered {bi + 1}/{len(beats)} beats ({time.time() - started:.0f}s)", flush=True)
-    except Exception:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        proc.kill()
-        proc.wait()
-        raise
-
-    proc.stdin.close()
-    if proc.wait():
-        raise RuntimeError("Video encode failed (ffmpeg returned an error).")
-    return output
-
-
-# ---------------------------------------------------------------------
-# SOUND EFFECTS + FINAL MIX
-# ---------------------------------------------------------------------
-
-def _sine(freq, dur):
-    return ["-f", "lavfi", "-i", f"sine=frequency={freq}:duration={dur}"]
-
-
-SFX_RECIPES = {
-    "pop": (_sine(1250, 0.1), ["-af", "afade=t=out:st=0.03:d=0.07,volume=0.5"]),
-    "boom": (_sine(58, 0.8) + _sine(117, 0.8),
-             ["-filter_complex", "[0:a][1:a]amix=inputs=2:normalize=0,afade=t=out:st=0.05:d=0.75,volume=2.2"]),
-    "horn": (_sine(466, 0.7) + _sine(587, 0.7) + _sine(698, 0.7),
-             ["-filter_complex", "[0:a][1:a][2:a]amix=inputs=3:normalize=0,tremolo=f=16:d=0.6,"
-                                 "afade=t=out:st=0.4:d=0.3,volume=1.3"]),
-    "ding": (_sine(1568, 0.6), ["-af", "afade=t=out:st=0.05:d=0.55,volume=0.5"]),
-    "whoosh": (["-f", "lavfi", "-i", "anoisesrc=color=pink:duration=0.35:amplitude=0.5"],
-               ["-af", "highpass=f=700,lowpass=f=5000,afade=t=in:d=0.15,afade=t=out:st=0.15:d=0.2,volume=0.6"]),
-}
-
-
-def build_sfx(events, total, folder):
-    for kind in sorted({k for _, k in events}):
-        inputs, filt = SFX_RECIPES[kind]
-        run(["ffmpeg", "-y", *inputs, *filt, "-ar", "24000", "-ac", "1", f"{kind}.wav"], cwd=folder)
-
-    command = ["ffmpeg", "-y", "-f", "lavfi", "-t", f"{total + 1:.2f}",
-               "-i", "anullsrc=r=24000:cl=mono"]
-    graph = []
-    for i, (t, kind) in enumerate(events):
-        command += ["-i", f"{kind}.wav"]
-        graph.append(f"[{i + 1}:a]adelay={int(t * 1000)}:all=1[e{i}]")
-    labels = "[0:a]" + "".join(f"[e{i}]" for i in range(len(events)))
-    graph.append(f"{labels}amix=inputs={len(events) + 1}:duration=first:normalize=0[out]")
-    command += ["-filter_complex", ";".join(graph), "-map", "[out]",
-                "-ac", "1", "-ar", "24000", "sfx.wav"]
-    run(command, cwd=folder)
-    return folder / "sfx.wav"
-
-
-def mix_final(background, voice, sfx, workdir, output, duration):
-    music_files = pick_files(ROOT / "music", AUDIO_EXT)
-    music = random.choice(music_files) if music_files else None
-
-    command = ["ffmpeg", "-y", "-i", str(background), "-i", str(voice), "-i", str(sfx)]
-    graph = ("[1:a]loudnorm=I=-15:TP=-1.5:LRA=9[v];"
-             "[2:a]volume=0.6[s];")
-    if music:
-        command += ["-stream_loop", "-1", "-i", str(music)]
-        graph += (f"[3:a]volume={CFG['music_volume']}[m];"
-                  "[v][s][m]amix=inputs=3:duration=first:dropout_transition=0:normalize=0[a]")
-    else:
-        graph += "[v][s]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
-
-    command += ["-filter_complex", graph, "-map", "0:v", "-map", "[a]",
-                "-t", f"{duration + 0.1:.2f}", "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
-    run(command, cwd=workdir)
-    return music.name if music else None
-
-
-# ---------------------------------------------------------------------
-# PRODUCE ONE EPISODE
-# ---------------------------------------------------------------------
-
-def make_video(index):
-    state = load_state()
-    episode_number = max([e.get("ep", 0) for e in state["episodes"]] + [0]) + 1
-
-    data = write_episode(episode_number, state)
-    folder = OUT_DAY / f"{index:02d}_ep{episode_number}_{safe_name(data['title'])}"
-    folder.mkdir(parents=True, exist_ok=True)
-    beats = data["beats"]
-
-    (folder / "script.txt").write_text(
-        "\n".join(f"[{b['scene']}] {b['text']}" for b in beats), encoding="utf-8")
-
-    print("Generating narration...")
-    durations = voice_beats(beats, folder)
-
-    timeline = build_timeline(beats, durations)
-    total = timeline["total"]
-    print(f"Video length: {total:.1f}s, {len(beats)} beats, {len(timeline['chips'])} chips")
-
-    print("Rendering 3D scenes...")
-    background = render_blocks(beats, timeline, data["title"], episode_number, folder)
-
-    print("Mixing sound...")
-    sfx = build_sfx(timeline["sfx"], total, folder)
-    music = mix_final(background, folder / "voice.wav", sfx, folder,
-                      folder / "video.mp4", total)
-
-    for pattern in ("voice_raw_*", "voice_[0-9]*.wav", "voice_list.txt", "bg.mp4",
-                    "pop.wav", "boom.wav", "horn.wav", "ding.wav", "whoosh.wav", "sfx.wav"):
-        for path in folder.glob(pattern):
-            path.unlink(missing_ok=True)
-
-    metadata = {
-        "episode": episode_number,
-        "series": SERIES_NAME,
-        "title": data["title"],
-        "description": data.get("description", "") + "\n\nFictional comedy story. General info only, not advice. #Shorts",
-        "summary": data.get("summary", ""),
-        "tags": data.get("tags", []),
-        "duration_sec": round(total, 1),
-        "brainrot_edit": CFG["brainrot"],
-        "voice": CFG["voice"] if _TTS_STATE["edge_ok"] else "piper (fallback)",
-        "music_used": music,
-        "review_checklist": [
-            "Watch the complete video before uploading.",
-            "Check the facts in the consequence tags before posting.",
-            "Confirm any music license.",
-            "Apply the synthetic-content disclosure if applicable.",
-        ],
-    }
-    (folder / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-    if not CFG["demo"]:
-        if data["topic"] not in state["topics"]:
-            state["topics"].append(data["topic"])
-        state["episodes"].append({
-            "ep": episode_number, "topic": data["topic"],
-            "title": data["title"], "summary": data.get("summary", ""),
-        })
-        save_state(state)
-
-    return str(folder), data["title"]
-
-
-# ---------------------------------------------------------------------
-# NOTIFICATIONS
-# ---------------------------------------------------------------------
-
-def notify(message):
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return
-    try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat, "text": message[:4000]}, timeout=15)
-    except Exception as exc:
-        print("Telegram message failed:", exc)
-
-
-def notify_video(path, caption):
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return
-    try:
-        with open(path, "rb") as video:
-            response = requests.post(
-                f"https://api.telegram.org/bot{token}/sendVideo",
-                data={"chat_id": chat, "caption": caption[:900]},
-                files={"video": video}, timeout=180)
-        response.raise_for_status()
-    except Exception as exc:
-        print("Telegram video notification failed:", exc)
-
-
-# ---------------------------------------------------------------------
-# PREFLIGHT + MAIN
-# ---------------------------------------------------------------------
-
-def preflight():
-    errors = []
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            errors.append(f"{tool} is missing from PATH.")
-
-    import importlib.util
-    has_edge = importlib.util.find_spec("edge_tts") is not None
-    has_piper = bool(shutil.which(CFG["piper_bin"])) and Path(CFG["piper_model"]).exists()
-    if not has_edge and not has_piper:
-        errors.append("No narration voice: install edge-tts (pip install edge-tts) or Piper.")
-    elif not has_edge:
-        print("NOTE: edge-tts not installed, using the robotic Piper voice.")
-        _TTS_STATE["edge_ok"] = False
-
-    if not CFG["demo"] and not os.getenv("GEMINI_API_KEY"):
-        try:
-            requests.get(CFG["ollama_url"].rsplit("/api", 1)[0], timeout=4)
-        except Exception:
-            errors.append("Set GEMINI_API_KEY or run a reachable Ollama server (or set DEMO=1).")
-    return errors
-
-
-def main():
-    OUT_DAY.mkdir(parents=True, exist_ok=True)
-
-    if CFG["voice"].lower() == "samples":
-        make_voice_samples()
-        print("Voice samples saved in output/.../voice_samples. Download the artifact, "
-              "listen, then set the VOICE variable to the file name you like.")
-        return
-
-    print("Starting Shorts Factory v5 (blocky 3D story style)...")
-    print("Videos requested:", CFG["videos_per_run"], "| demo story:", CFG["demo"])
-
-    errors = preflight()
-    completed = []
-
-    if not errors:
-        start_index = len([p for p in OUT_DAY.iterdir() if p.is_dir()]) + 1
-        count = 1 if CFG["demo"] else CFG["videos_per_run"]
-
-        for offset in range(count):
-            try:
-                folder, title = make_video(start_index + offset)
-                completed.append((title, folder))
-                notify_video(Path(folder) / "video.mp4", title)
-                print(f"Completed: {title}")
-            except Exception as exc:
-                message = f"Video {offset + 1}: {exc}"
-                errors.append(message)
-                print(message)
-                with (OUT_DAY / "errors.log").open("a", encoding="utf-8") as log:
-                    log.write(traceback.format_exc() + "\n")
-                if "429" in str(exc):
-                    break  # out of Gemini quota; stop instead of burning more
-    else:
-        for error in errors:
-            print("PREFLIGHT:", error)
-
-    report = [
-        f"# Daily report - {TODAY}",
-        f"Completed: {len(completed)}",
-        f"Errors: {len(errors)}",
-        f"Voice: {CFG['voice']}",
-        "",
-    ]
-    report.extend(f"- COMPLETE: {title} -> {folder}" for title, folder in completed)
-    report.extend(f"- ERROR: {error}" for error in errors)
-    report.append("\nReview each video's video.mp4 and meta.json before uploading.")
-    report_text = "\n".join(report)
-
-    with (OUT_DAY / "report.md").open("a", encoding="utf-8") as out:
-        out.write(report_text + "\n\n")
-    print(report_text)
-    notify(report_text)
-
-    if errors and not completed:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+                    cap = cap.resize((int(cap.widt
